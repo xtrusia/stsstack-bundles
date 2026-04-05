@@ -109,6 +109,17 @@ for app in d.get('applications', {}).values():
     echo "DNS timeout patch applied and errors resolved."
 }
 
+# Clean up stale ext-port Neutron ports from previous zaza deployments.
+# These accumulate and cause data-port MAC mismatch on neutron-gateway.
+cleanup_stale_ext_ports ()
+{
+    echo "Cleaning up stale ext-port Neutron ports..."
+    source $OPENRC
+    for port_id in $(openstack port list -f value -c ID -c Name -c Status 2>/dev/null | grep ext-port | grep DOWN | awk '{print $1}'); do
+        openstack port delete $port_id 2>/dev/null && echo "Deleted stale ext-port: $port_id"
+    done
+}
+
 run_test_phase ()
 {
     local phase=$1
@@ -455,6 +466,7 @@ for target in ${func_target_order[@]}; do
         read -p "Destroy model '$model' and run next test? [ENTER]"
     fi
 
+    cleanup_stale_ext_ports
     destroy_zaza_models
 done
 popd &>/dev/null || true
