@@ -301,7 +301,7 @@ export {,TEST_}CIDR_PRIV=${TEST_CIDR_PRIV:-192.168.21.0/24}
 # Model settings: config-drive is required for Gazpacho environment
 # Set model-level default constraints so VMs get adequate resources.
 # m1.tiny (1 vCPU/1GB) is too small for most charms — use at least 2 cores/4GB.
-export TEST_MODEL_SETTINGS="image-stream=released;default-series=jammy;test-mode=true;transmit-vendor-metrics=false"
+export TEST_MODEL_SETTINGS="image-stream=released;default-series=jammy;test-mode=true;transmit-vendor-metrics=false;apt-mirror=http://mirror.seyeong.kim/ubuntu;logging-config=<root>=WARNING;automatically-retry-hooks=true"
 export TEST_MODEL_CONSTRAINTS="mem=4G;cores=2;root-disk=20G"
 
 export TEST_JUJU3=1
