@@ -422,7 +422,7 @@ for target in ${func_target_order[@]}; do
         model=$(juju list-models| egrep -o "^zaza-\S+"|tr -d '*')
 
         # Stop DNS patch watcher
-        [[ -n "$_watcher_pid" ]] && kill $_watcher_pid 2>/dev/null && wait $_watcher_pid 2>/dev/null
+        if [[ -n "$_watcher_pid" ]]; then kill $_watcher_pid 2>/dev/null; wait $_watcher_pid 2>/dev/null || true; fi
         # Auto-patch DNS timeout if deploy succeeded but later phases failed.
         # After patching and resolving errors, retry configure+test phases.
         if [[ -n "$model" ]] && $fail; then
