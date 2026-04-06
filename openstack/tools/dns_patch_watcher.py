@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-DNS Patch Watcher v2 - auto-detects zaza model, patches charmhelpers ip.py
-as soon as charm is installed, resolves error units automatically.
+DNS Patch Watcher v3 - auto-detects zaza model, patches charmhelpers ip.py
+as soon as charm is installed, resolves error units, and ensures br-ex is UP
+on neutron-gateway.
 
 Usage: python3 dns_patch_watcher.py [model-name]
   If no model given, auto-detects zaza-* model.
@@ -57,25 +58,28 @@ def find_zaza_model():
     return None
 
 
-def get_started_machines(model):
+def get_model_status(model):
     out, rc = run(["juju", "status", "-m", model, "--format", "json"])
     if rc != 0:
-        return [], []
+        return [], [], []
     try:
         data = json.loads(out)
     except Exception:
-        return [], []
+        return [], [], []
     machines = [mid for mid, m in data.get("machines", {}).items()
                 if m.get("juju-status", {}).get("current") == "started"]
     errors = []
-    for app in data.get("applications", {}).values():
+    gw_units = []
+    for app_name, app in data.get("applications", {}).items():
         for name, unit in app.get("units", {}).items():
             if unit.get("juju-status", {}).get("current") == "error":
                 errors.append(name)
+            if app_name == "neutron-gateway":
+                gw_units.append(name)
             for sub_name, sub in unit.get("subordinates", {}).items():
                 if sub.get("juju-status", {}).get("current") == "error":
                     errors.append(sub_name)
-    return machines, errors
+    return machines, errors, gw_units
 
 
 def patch_machine(model, mid):
@@ -88,15 +92,22 @@ def patch_machine(model, mid):
     return "NONE"
 
 
+def fix_brex(model, unit):
+    """Ensure br-ex is UP on neutron-gateway unit."""
+    out, _ = run(["juju", "exec", "-m", model, "--unit", unit,
+                  "--", "sudo ip link set br-ex up 2>/dev/null; ip -br link show br-ex 2>/dev/null"])
+    return "UP" in out
+
+
 def main():
     model = sys.argv[1] if len(sys.argv) > 1 else None
-    done = set()
+    done_machines = set()
+    done_brex = set()
     p = lambda *a: print(*a, flush=True)
 
     p("[watcher] Starting, model=%s" % (model or "auto-detect"))
 
     while True:
-        # Auto-detect model if not given or model disappeared
         if not model:
             model = find_zaza_model()
             if not model:
@@ -104,28 +115,37 @@ def main():
                 continue
             p("[watcher] Found model: %s" % model)
 
-        machines, errors = get_started_machines(model)
+        machines, errors, gw_units = get_model_status(model)
         if not machines and not errors:
-            # Model might have been destroyed
             out, _ = run(["juju", "list-models"])
             if model not in out:
                 p("[watcher] Model %s gone, waiting for new one" % model)
                 model = None
-                done.clear()
+                done_machines.clear()
+                done_brex.clear()
                 time.sleep(5)
                 continue
 
+        # Patch charmhelpers DNS
         for mid in machines:
-            if mid in done:
+            if mid in done_machines:
                 continue
             result = patch_machine(model, mid)
             if result == "PATCHED":
                 p("[watcher] machine %s: PATCHED" % mid)
-                done.add(mid)
+                done_machines.add(mid)
             elif result == "CLEAN":
-                done.add(mid)
-            # NONE = no ip.py yet, retry next loop
+                done_machines.add(mid)
 
+        # Ensure br-ex UP on neutron-gateway
+        for unit in gw_units:
+            if unit in done_brex:
+                continue
+            if fix_brex(model, unit):
+                p("[watcher] %s: br-ex UP" % unit)
+                done_brex.add(unit)
+
+        # Auto-resolve error units
         for unit in errors:
             run(["juju", "resolved", "-m", model, unit], timeout=10)
             p("[watcher] resolved %s" % unit)

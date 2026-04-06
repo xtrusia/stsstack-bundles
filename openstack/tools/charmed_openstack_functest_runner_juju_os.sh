@@ -120,6 +120,23 @@ cleanup_stale_ext_ports ()
     done
 }
 
+# Ensure br-ex is UP on neutron-gateway units.
+# OVS doesn't auto-UP br-ex when data-port is added, causing floating IP
+# and metadata service failures.
+fix_brex_on_gateway ()
+{
+    local model=$1
+    echo "Ensuring br-ex is UP on neutron-gateway..."
+    for unit in $(juju status -m $model neutron-gateway --format json 2>/dev/null | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+for name in d.get('applications', {}).get('neutron-gateway', {}).get('units', {}):
+    print(name)
+" 2>/dev/null); do
+        juju exec -m $model --unit $unit -- 'sudo ip link set br-ex up 2>/dev/null && echo "br-ex UP on '$unit'"' 2>/dev/null || true
+    done
+}
+
 run_test_phase ()
 {
     local phase=$1
@@ -312,7 +329,7 @@ export {,TEST_}CIDR_PRIV=${TEST_CIDR_PRIV:-192.168.21.0/24}
 # Model settings: config-drive is required for Gazpacho environment
 # Set model-level default constraints so VMs get adequate resources.
 # m1.tiny (1 vCPU/1GB) is too small for most charms — use at least 2 cores/4GB.
-export TEST_MODEL_SETTINGS="image-stream=released;default-series=jammy;test-mode=true;transmit-vendor-metrics=false;apt-mirror=http://mirror.seyeong.kim/ubuntu;logging-config=<root>=WARNING;automatically-retry-hooks=true"
+export TEST_MODEL_SETTINGS="image-stream=released;default-series=jammy;test-mode=true;transmit-vendor-metrics=false;automatically-retry-hooks=true"
 export TEST_MODEL_CONSTRAINTS="mem=4G;cores=2;root-disk=20G"
 
 export TEST_JUJU3=1
@@ -438,6 +455,7 @@ for target in ${func_target_order[@]}; do
         # After patching and resolving errors, retry configure+test phases.
         if [[ -n "$model" ]] && $fail; then
             patch_charmhelpers_dns $model
+            fix_brex_on_gateway $model
             echo "Retrying configure and test phases after DNS patch..."
                 # Patch vault setup.py to handle already-initialized vault (KeyError: 'output')
             _vault_setup=".tox/func-target/lib/python3.8/site-packages/zaza/openstack/charm_tests/vault/setup.py"
@@ -446,7 +464,7 @@ for target in ${func_target_order[@]}; do
                 echo "Vault setup.py patched for retry"
             fi
             . .tox/func-target/bin/activate
-            functest-configure -m $model && functest-test -m $model && fail=false
+            functest-test -m $model && fail=false
             deactivate
         fi
     else
