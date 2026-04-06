@@ -292,15 +292,9 @@ export {,TEST_}NET_ID=$(openstack network show $OS_NETWORK -f value -c id)
 export {,TEST_}GATEWAY=$(openstack subnet show $OS_SUBNET -c gateway_ip -f value)
 
 # FIP range: use the allocation pool range from the subnet
-# provider-subnet allocation pool: 192.168.2.100 - 192.168.2.250
-FIP_RANGE_RAW=$(openstack subnet show $OS_SUBNET -f json -c allocation_pools | \
-    python3 -c "import sys,json; pools=json.load(sys.stdin)['allocation_pools']; p=pools[0] if isinstance(pools,list) else pools; print(p['start']+':'+p['end'])" 2>/dev/null || true)
-if [[ -z $FIP_RANGE_RAW ]]; then
-    # Fallback: parse from yaml
-    FIP_RANGE_RAW=$(openstack subnet show $OS_SUBNET -f yaml -c allocation_pools | \
-        python3 -c "import sys,yaml; pools=yaml.safe_load(sys.stdin)['allocation_pools']; print(pools[0]['start']+':'+pools[0]['end'])")
-fi
-export {,TEST_}FIP_RANGE=$FIP_RANGE_RAW
+# Floating IP range for overcloud ext_net — must NOT overlap with undercloud
+# allocation pool (192.168.2.100-179). Use 192.168.2.180-250 for floating IPs.
+export {,TEST_}FIP_RANGE=192.168.2.180:192.168.2.250
 
 # Setup VIPs needed by zaza tests.
 allocate_zaza_vip ()
