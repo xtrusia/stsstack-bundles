@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-DNS Patch Watcher v3 - auto-detects zaza model, patches charmhelpers ip.py
-as soon as charm is installed, resolves error units, and ensures br-ex is UP
-on neutron-gateway.
+DNS Patch Watcher v5 - auto-detects zaza model, patches charmhelpers ip.py,
+ensures br-ex is UP with data-port attached on neutron-gateway,
+and resolves error units automatically.
 
 Usage: python3 dns_patch_watcher.py [model-name]
-  If no model given, auto-detects zaza-* model.
 """
 import subprocess
 import sys
 import time
 import json
 
+# Patch script that handles both old (dnspython 1.x) and new (2.0+) versions
 PATCH_SCRIPT = '''
 import glob
 files = glob.glob("/var/lib/juju/agents/*/charm/**/network/ip.py", recursive=True) + \
@@ -24,16 +24,41 @@ else:
         with open(f) as fh:
             c = fh.read()
         if "dns.resolver.query(address, rtype)" in c:
+            # Check dnspython version to use correct method
             c = c.replace(
                 "answers = dns.resolver.query(address, rtype)",
-                "resolver = dns.resolver.Resolver()\\n        resolver.lifetime = 30\\n        answers = resolver.resolve(address, rtype)")
+                "resolver = dns.resolver.Resolver()\\n"
+                "        resolver.lifetime = 30\\n"
+                "        _resolve = getattr(resolver, \\"resolve\\", getattr(resolver, \\"query\\", None))\\n"
+                "        answers = _resolve(address, rtype)")
             c = c.replace(
                 "except (dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):",
-                "except (dns.resolver.NXDOMAIN, dns.resolver.NoNameservers, dns.exception.Timeout):")
+                "except (dns.resolver.NXDOMAIN, dns.resolver.NoNameservers, dns.exception.Timeout, Exception):")
             with open(f, "w") as fh:
                 fh.write(c)
             patched.append(f)
     print("PATCHED:" + ",".join(patched) if patched else "CLEAN")
+'''
+
+BREX_SCRIPT = '''
+import subprocess, json
+result = subprocess.run(["ovs-vsctl", "list-ports", "br-ex"], capture_output=True, text=True)
+ports = result.stdout.strip().split("\\n") if result.stdout.strip() else []
+has_physical = any(p for p in ports if not p.startswith("phy-") and p != "")
+if has_physical:
+    print("OK")
+else:
+    result = subprocess.run(["ip", "-j", "link", "show"], capture_output=True, text=True)
+    interfaces = json.loads(result.stdout)
+    for iface in interfaces:
+        name = iface.get("ifname", "")
+        if name.startswith("ens") and name != "ens3" and "LOOPBACK" not in iface.get("flags", []):
+            subprocess.run(["ovs-vsctl", "add-port", "br-ex", name], capture_output=True)
+            subprocess.run(["ip", "link", "set", "br-ex", "up"], capture_output=True)
+            print("FIXED:" + name)
+            break
+    else:
+        print("NOFIX")
 '''
 
 
@@ -93,10 +118,13 @@ def patch_machine(model, mid):
 
 
 def fix_brex(model, unit):
-    """Ensure br-ex is UP on neutron-gateway unit."""
     out, _ = run(["juju", "exec", "-m", model, "--unit", unit,
-                  "--", "sudo ip link set br-ex up 2>/dev/null; ip -br link show br-ex 2>/dev/null"])
-    return "UP" in out
+                  "--", "sudo python3 -c '%s'" % BREX_SCRIPT])
+    if "FIXED:" in out:
+        return "FIXED"
+    elif "OK" in out:
+        return "OK"
+    return "NOFIX"
 
 
 def main():
@@ -126,7 +154,6 @@ def main():
                 time.sleep(5)
                 continue
 
-        # Patch charmhelpers DNS
         for mid in machines:
             if mid in done_machines:
                 continue
@@ -137,15 +164,16 @@ def main():
             elif result == "CLEAN":
                 done_machines.add(mid)
 
-        # Ensure br-ex UP on neutron-gateway
         for unit in gw_units:
             if unit in done_brex:
                 continue
-            if fix_brex(model, unit):
-                p("[watcher] %s: br-ex UP" % unit)
+            result = fix_brex(model, unit)
+            if result == "FIXED":
+                p("[watcher] %s: br-ex FIXED" % unit)
+                done_brex.add(unit)
+            elif result == "OK":
                 done_brex.add(unit)
 
-        # Auto-resolve error units
         for unit in errors:
             run(["juju", "resolved", "-m", model, unit], timeout=10)
             p("[watcher] resolved %s" % unit)

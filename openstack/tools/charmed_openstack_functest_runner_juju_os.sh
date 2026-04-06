@@ -88,8 +88,8 @@ import glob
 for f in glob.glob(\"/var/lib/juju/agents/*/charm/**/network/ip.py\", recursive=True) + glob.glob(\"/var/lib/juju/agents/*/charm/hooks/**/network/ip.py\", recursive=True):
     with open(f) as fh: c = fh.read()
     if \"dns.resolver.query(address, rtype)\" in c:
-        c = c.replace(\"answers = dns.resolver.query(address, rtype)\", \"resolver = dns.resolver.Resolver()\\n        resolver.lifetime = 30\\n        answers = resolver.resolve(address, rtype)\")
-        c = c.replace(\"except (dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):\", \"except (dns.resolver.NXDOMAIN, dns.resolver.NoNameservers, dns.exception.Timeout):\")
+        c = c.replace(\"answers = dns.resolver.query(address, rtype)\", \"resolver = dns.resolver.Resolver()\\n        resolver.lifetime = 30\\n        _resolve = getattr(resolver, \\\"resolve\\\", getattr(resolver, \\\"query\\\", None))\\n        answers = _resolve(address, rtype)\")
+        c = c.replace(\"except (dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):\", \"except (dns.resolver.NXDOMAIN, dns.resolver.NoNameservers, dns.exception.Timeout, Exception):\")
         with open(f, \"w\") as fh: fh.write(c)
 "' || true
     # Also resolve any units that already failed due to DNS timeout
