@@ -19,6 +19,36 @@ RERUN_PHASE=
 
 . $(dirname $0)/func_test_tools/common.sh
 
+# Override destroy_zaza_models: force delete via MongoDB to avoid stuck models.
+PASSWORD="d6E6xi6LDXpecYOVTSGF5I3h"
+destroy_zaza_models ()
+{
+    for model in $(juju list-models 2>/dev/null | grep -oE "^zaza-\S+" | tr -d '*'); do
+        UUID=$(juju show-model "$model" --format json 2>/dev/null | \
+            python3 -c 'import sys,json;print(list(json.load(sys.stdin).values())[0]["model-uuid"])' 2>/dev/null || true)
+        [ -z "$UUID" ] && continue
+        echo "Force destroying model $model ($UUID)"
+        juju ssh -m controller 0 "sudo python3 -c \"
+import pymongo
+client=pymongo.MongoClient('mongodb://machine-0:${PASSWORD}@127.0.0.1:37017/admin',tls=True,tlsCAFile='/var/snap/juju-db/common/ca.crt',tlsCertificateKeyFile='/var/snap/juju-db/common/server.pem',tlsAllowInvalidHostnames=True,directConnection=True,serverSelectionTimeoutMS=5000)
+juju_db=client['juju']
+juju_db.models.delete_one({'_id':'${UUID}'})
+client.drop_database('${UUID}'.replace('-',''))
+for c in juju_db.list_collection_names():
+    try: juju_db[c].delete_many({'model-uuid':'${UUID}'})
+    except: pass
+print('Done')
+\"" 2>/dev/null
+    done
+    juju switch default 2>/dev/null || true
+    # Clean up OpenStack resources
+    source $OPENRC
+    for id in $(openstack server list -f value -c ID -c Name 2>/dev/null | grep zaza | awk '{print $1}'); do
+        openstack server delete "$id" 2>/dev/null
+    done
+    cleanup_stale_ext_ports
+}
+
 # -------------------------------------------------------------------
 # Environment defaults for juju-os-controller / myopenstack
 # Override any of these via env vars before running.
