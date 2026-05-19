@@ -32,6 +32,8 @@ import sys
 import time
 from typing import Any
 
+import yaml
+
 
 MANIFEST = "manifest.json"
 DEFAULT_CHECKPOINT_DIR = "~/.local/share/juju-model-checkpoints"
@@ -400,6 +402,56 @@ def read_manifest(path: pathlib.Path) -> dict[str, Any]:
     return json.loads(manifest_path.read_text(encoding="utf-8"))
 
 
+def load_yaml(path: pathlib.Path) -> dict[str, Any]:
+    """Read a YAML document into a Python mapping."""
+    return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+
+def dump_yaml(data: dict[str, Any], path: pathlib.Path) -> None:
+    """Write a YAML document, preserving key order."""
+    path.write_text(
+        yaml.safe_dump(data, default_flow_style=False, sort_keys=False),
+        encoding="utf-8",
+    )
+
+
+def inject_image_id_into_bundle(
+    bundle: dict[str, Any],
+    baseline: dict[str, Any],
+) -> None:
+    """Add `image-id` constraints to bundle machines from a baseline."""
+    machines = bundle.get("machines") or {}
+    if not machines:
+        raise CheckpointError(
+            "bundle has no explicit 'machines:' section; this PoC requires "
+            "machine-pinned bundles"
+        )
+    baseline_machines = baseline.get("machines") or {}
+    missing = sorted(set(machines) - set(baseline_machines))
+    if missing:
+        raise CheckpointError(
+            f"baseline lacks images for bundle machines: {missing}"
+        )
+    extra = sorted(set(baseline_machines) - set(machines))
+    if extra:
+        print(
+            f"warning: baseline has machines not used by bundle: {extra}",
+            file=sys.stderr,
+        )
+    for machine_id, machine in machines.items():
+        image_id = baseline_machines[str(machine_id)]["snapshot_image_id"]
+        existing = (machine or {}).get("constraints") or ""
+        parts = [
+            piece for piece in existing.split()
+            if piece and not piece.startswith("image-id=")
+        ]
+        parts.insert(0, f"image-id={image_id}")
+        if machine is None:
+            machines[machine_id] = {"constraints": " ".join(parts)}
+        else:
+            machine["constraints"] = " ".join(parts)
+
+
 def save_supporting_state(snapshot_dir: pathlib.Path, model: str) -> None:
     """Save Juju state useful for later inspection."""
     (snapshot_dir / "juju-status.json").write_text(
@@ -613,6 +665,24 @@ def command_bake(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_apply_baseline(args: argparse.Namespace) -> int:
+    """Inject baseline image-ids into a bundle yaml and write a new file."""
+    baseline_path = pathlib.Path(args.baseline).expanduser()
+    baseline = read_manifest(baseline_path)
+    if baseline.get("type") != "baseline":
+        raise CheckpointError(
+            f"manifest is not a baseline: type={baseline.get('type')!r}"
+        )
+    bundle_path = pathlib.Path(args.bundle).expanduser()
+    bundle = load_yaml(bundle_path)
+    inject_image_id_into_bundle(bundle, baseline)
+    out_path = pathlib.Path(args.output).expanduser()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    dump_yaml(bundle, out_path)
+    print(f"baseline-injected bundle written to {out_path}")
+    return 0
+
+
 def verify_restore_target(
     manifest: dict[str, Any],
     model: str,
@@ -773,6 +843,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip ssh-based in-VM cleanup (debugging only)",
     )
     bake.set_defaults(func=command_bake)
+
+    apply_baseline = subparsers.add_parser(
+        "apply-baseline",
+        help="inject image-id constraints from a baseline into a bundle",
+    )
+    apply_baseline.add_argument(
+        "--baseline", required=True,
+        help="baseline manifest directory or file",
+    )
+    apply_baseline.add_argument(
+        "--bundle", required=True, help="input bundle yaml",
+    )
+    apply_baseline.add_argument(
+        "--output", required=True, help="output bundle yaml",
+    )
+    apply_baseline.set_defaults(func=command_apply_baseline)
 
     restore = subparsers.add_parser("restore", help="restore in place")
     restore.add_argument("-m", "--model", required=True)

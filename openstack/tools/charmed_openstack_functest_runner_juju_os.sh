@@ -11,6 +11,8 @@ FUNC_TEST_PR=
 FUNC_TEST_TARGET=()
 BAKE_BASELINE=
 BAKE_SKIP_CLEANUP=false
+DEPLOY_FROM_BASELINE=
+DEPLOY_FROM_BASELINE_RUN_TEST=false
 CHECKPOINT_ALLOW_VOLUME_BACKED=false
 CHECKPOINT_CREATE=
 CHECKPOINT_DIR=${JUJU_MODEL_CHECKPOINT_DIR:-$HOME/juju-model-checkpoints}
@@ -112,6 +114,13 @@ OPTIONS:
     --bake-skip-cleanup
         Skip in-VM cleanup (cloud-init clean, juju agent removal) before
         snapshotting. Debugging only — new deploys will likely fail.
+    --deploy-from-baseline DIR_OR_MANIFEST
+        Run zaza deploy and configure phases using a previously baked
+        baseline. The bundle is rewritten to pin each machine to its
+        baseline Glance image via the image-id constraint.
+    --deploy-from-baseline-run-test
+        With --deploy-from-baseline, run the zaza test phase after deploy
+        and configure complete.
     --help
         This help message.
 
@@ -345,6 +354,57 @@ run_bake_baseline_flow ()
 }
 
 
+apply_baseline_to_bundle ()
+{
+    local baseline=$1
+    local in_bundle=$2
+    local out_bundle=$3
+
+    JUJU_CMD="$CHECKPOINT_JUJU_CMD" \
+        OPENSTACK_CMD="$CHECKPOINT_OPENSTACK_CMD" \
+        "$(checkpoint_tool)" apply-baseline \
+        --baseline "$baseline" \
+        --bundle "$in_bundle" \
+        --output "$out_bundle"
+}
+
+
+run_deploy_from_baseline_flow ()
+{
+    local target=$1
+    local recreate_noop=$2
+    local baseline=$DEPLOY_FROM_BASELINE
+    local bundle
+    local in_bundle
+    local out_bundle
+    local model
+    local ret=0
+
+    bundle="$(python3 "$TOOLS_PATH/extract_job_target.py" "$target")"
+    in_bundle="tests/bundles/$bundle.yaml"
+    out_bundle="tests/bundles/${bundle}-baseline.yaml"
+    model="$(qualify_model "test-$target")"
+
+    apply_baseline_to_bundle "$baseline" "$in_bundle" "$out_bundle" \
+        || return $?
+    ensure_func_noop_env "$recreate_noop" || return $?
+    juju add-model "test-$target" --no-switch || return $?
+    configure_checkpoint_model "$model" || return $?
+
+    . .tox/func-noop/bin/activate
+    functest-deploy -b "$out_bundle" -m "$model" || ret=$?
+    if ((! ret)); then
+        juju status -m "$model"
+        functest-configure -m "$model" || ret=$?
+    fi
+    if ((! ret)) && $DEPLOY_FROM_BASELINE_RUN_TEST; then
+        functest-test -m "$model" || ret=$?
+    fi
+    deactivate
+    return $ret
+}
+
+
 run_test_phase ()
 {
     local phase=$1
@@ -492,6 +552,13 @@ while (($# > 0)); do
         --bake-skip-cleanup)
             BAKE_SKIP_CLEANUP=true
             ;;
+        --deploy-from-baseline)
+            DEPLOY_FROM_BASELINE=$2
+            shift
+            ;;
+        --deploy-from-baseline-run-test)
+            DEPLOY_FROM_BASELINE_RUN_TEST=true
+            ;;
         --help|-h)
             usage
             exit 0
@@ -513,6 +580,17 @@ fi
 if [[ -n $BAKE_BASELINE ]] && \
    [[ -n $CHECKPOINT_CREATE || -n $CHECKPOINT_RESTORE ]]; then
     echo "ERROR: --bake-baseline is mutually exclusive with --checkpoint-create/--checkpoint-restore" >&2
+    exit 1
+fi
+
+if [[ -n $DEPLOY_FROM_BASELINE ]] && \
+   [[ -n $CHECKPOINT_CREATE || -n $CHECKPOINT_RESTORE || -n $BAKE_BASELINE ]]; then
+    echo "ERROR: --deploy-from-baseline is mutually exclusive with --checkpoint-*/--bake-baseline" >&2
+    exit 1
+fi
+
+if $DEPLOY_FROM_BASELINE_RUN_TEST && [[ -z $DEPLOY_FROM_BASELINE ]]; then
+    echo "ERROR: --deploy-from-baseline-run-test requires --deploy-from-baseline" >&2
     exit 1
 fi
 
@@ -766,6 +844,20 @@ for target in ${func_target_order[@]}; do
         [[ -d src ]] && pushd src &>/dev/null || true
         fail=false
         run_bake_baseline_flow "$target" "$init_noop_target" || fail=true
+        popd &>/dev/null || true
+        init_noop_target=false
+        if $fail; then
+            func_target_state[$target]='fail'
+        else
+            func_target_state[$target]='success'
+        fi
+        continue
+    fi
+
+    if [[ -n $DEPLOY_FROM_BASELINE ]]; then
+        [[ -d src ]] && pushd src &>/dev/null || true
+        fail=false
+        run_deploy_from_baseline_flow "$target" "$init_noop_target" || fail=true
         popd &>/dev/null || true
         init_noop_target=false
         if $fail; then
