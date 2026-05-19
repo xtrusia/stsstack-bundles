@@ -240,18 +240,15 @@ def collect_machine_metadata(
 
 
 def ssh_cleanup_machine(
-    address: str,
+    model: str,
     machine_id: str,
     ssh_user: str,
 ) -> None:
-    """Run cleanup commands inside a juju machine over ssh."""
-    target = f"{ssh_user}@{address}"
+    """Run cleanup commands inside a juju machine via `juju ssh`."""
+    target = f"{ssh_user}@{machine_id}" if ssh_user else machine_id
     cmd = [
-        "ssh",
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "LogLevel=ERROR",
-        "-o", "ConnectTimeout=15",
+        JUJU_CMD, "ssh",
+        "-m", model,
         target,
         "bash -s",
     ]
@@ -265,7 +262,7 @@ def ssh_cleanup_machine(
     )
     if proc.returncode:
         raise CheckpointError(
-            f"ssh cleanup of machine {machine_id} ({target}) failed "
+            f"juju ssh cleanup of machine {machine_id} failed "
             f"({proc.returncode}):\nstdout:\n{proc.stdout}\n"
             f"stderr:\n{proc.stderr}"
         )
@@ -627,9 +624,10 @@ def command_bake(args: argparse.Namespace) -> int:
 
         if not args.skip_cleanup:
             print(
-                f"cleanup machine {machine_id} via ssh {meta['address']}"
+                f"cleanup machine {machine_id} via juju ssh "
+                f"(address={meta['address']})"
             )
-            ssh_cleanup_machine(meta["address"], machine_id, args.ssh_user)
+            ssh_cleanup_machine(args.model, machine_id, args.ssh_user)
 
         image_name = (
             f"baseline-{slug(name)}-m{slug(machine_id)}-{timestamp}"
@@ -662,6 +660,160 @@ def command_bake(args: argparse.Namespace) -> int:
         "note: source model machines have been cleaned in place; "
         "destroy the source model before deploying from this baseline."
     )
+    return 0
+
+
+def juju_add_machine(
+    model: str,
+    *,
+    base: str,
+    image_id: str,
+    extra_constraints: str = "",
+) -> None:
+    """Pre-create a juju machine pinned to a baseline image."""
+    constraints = f"image-id={image_id}"
+    if extra_constraints:
+        constraints += " " + extra_constraints
+    run([
+        JUJU_CMD, "add-machine",
+        "-m", model,
+        "--base", base,
+        "--constraints", constraints,
+    ])
+
+
+def wait_for_machines_started(
+    model: str,
+    expected: int,
+    timeout: int,
+    interval: int = 15,
+) -> None:
+    """Wait until at least `expected` machines reach the 'started' state."""
+    deadline = time.monotonic() + timeout
+    last_started = -1
+    started = 0
+    while time.monotonic() < deadline:
+        status = juju_status(model)
+        machines = status.get("machines", {})
+        started = sum(
+            1 for m in machines.values()
+            if m.get("juju-status", {}).get("current") == "started"
+        )
+        if started != last_started:
+            print(f"machines started: {started}/{expected}")
+            last_started = started
+        if started >= expected:
+            return
+        time.sleep(interval)
+    raise CheckpointError(
+        f"only {started}/{expected} machines started within {timeout}s"
+    )
+
+
+def strip_image_id_constraints(bundle: dict[str, Any]) -> None:
+    """Remove `image-id=` tokens from machine constraints (CLI-only token)."""
+    machines = bundle.get("machines") or {}
+    for machine_id, machine in list(machines.items()):
+        if not machine:
+            continue
+        existing = machine.get("constraints") or ""
+        parts = [
+            p for p in existing.split()
+            if p and not p.startswith("image-id=")
+        ]
+        if parts:
+            machine["constraints"] = " ".join(parts)
+        else:
+            machine.pop("constraints", None)
+
+
+def wait_for_model_idle(
+    model: str,
+    timeout: int,
+    interval: int = 30,
+) -> None:
+    """Wait until a juju model reports idle (no blockers)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            status = juju_status(model)
+            is_idle, blockers = model_idle(status)
+            if is_idle:
+                print("juju model is idle")
+                return
+            head = "; ".join(blockers[:3])
+            more = f" (+{len(blockers) - 3} more)" if len(blockers) > 3 else ""
+            print(f"waiting for Juju idle: {head}{more}")
+        except CheckpointError as exc:
+            print(f"waiting for Juju status: {exc}")
+        time.sleep(interval)
+    raise CheckpointError(
+        f"model did not become idle within {timeout} seconds"
+    )
+
+
+def command_redeploy(args: argparse.Namespace) -> int:
+    """Redeploy a bundle into a model using a baseline.
+
+    Pre-creates juju machines pinned to the baseline glance images, then
+    runs `juju deploy <bundle> --map-machines=existing` so the bundle
+    re-uses those machines instead of provisioning fresh VMs.
+    """
+    baseline_path = pathlib.Path(args.baseline).expanduser()
+    baseline = read_manifest(baseline_path)
+    if baseline.get("type") != "baseline":
+        raise CheckpointError(
+            f"manifest is not a baseline: type={baseline.get('type')!r}"
+        )
+
+    bundle_path = pathlib.Path(args.bundle).expanduser()
+    bundle = load_yaml(bundle_path)
+    strip_image_id_constraints(bundle)
+    cleaned_path = bundle_path.with_name(
+        bundle_path.stem + "-redeploy" + bundle_path.suffix
+    )
+    dump_yaml(bundle, cleaned_path)
+    print(f"cleaned bundle written to {cleaned_path}")
+
+    model = args.model
+    machines = baseline.get("machines") or {}
+    expected = len(machines)
+    if not expected:
+        raise CheckpointError("baseline has no machines to redeploy")
+
+    print(f"add-machine x {expected} with image-id constraints")
+    for machine_id, mv in sorted(machines.items()):
+        print(
+            f"  add-machine {machine_id}: image={mv['snapshot_image_id']} "
+            f"base={mv['base']}"
+        )
+        juju_add_machine(
+            model,
+            base=mv["base"],
+            image_id=mv["snapshot_image_id"],
+        )
+
+    print(f"wait until {expected} machines reach 'started'")
+    wait_for_machines_started(
+        model, expected, timeout=args.machine_timeout
+    )
+
+    bundle_arg = str(cleaned_path.resolve())
+    print(f"deploy bundle {bundle_arg} with --map-machines=existing")
+    run([
+        JUJU_CMD, "deploy",
+        "-m", model,
+        bundle_arg,
+        "--map-machines=existing",
+    ])
+
+    if args.wait_for_idle:
+        print("wait for model idle")
+        wait_for_model_idle(
+            model,
+            timeout=args.idle_timeout,
+            interval=args.wait_interval,
+        )
     return 0
 
 
@@ -844,9 +996,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bake.set_defaults(func=command_bake)
 
+    redeploy = subparsers.add_parser(
+        "redeploy",
+        help="redeploy a bundle into a model using a baseline",
+    )
+    redeploy.add_argument("--baseline", required=True,
+                          help="baseline manifest directory or file")
+    redeploy.add_argument("--model", required=True,
+                          help="target juju model (must already exist)")
+    redeploy.add_argument("--bundle", required=True,
+                          help="input bundle yaml")
+    redeploy.add_argument("--machine-timeout", type=int, default=1800,
+                          help="seconds to wait for machines to start")
+    redeploy.add_argument("--idle-timeout", type=int, default=3600,
+                          help="seconds to wait for all units to be idle")
+    redeploy.add_argument("--wait-interval", type=int, default=30)
+    redeploy.add_argument("--no-wait", dest="wait_for_idle",
+                          action="store_false",
+                          help="do not wait for model idle after deploy")
+    redeploy.set_defaults(func=command_redeploy, wait_for_idle=True)
+
     apply_baseline = subparsers.add_parser(
         "apply-baseline",
-        help="inject image-id constraints from a baseline into a bundle",
+        help="(deprecated, juju rejects bundle image-id) inject image-id "
+             "constraints from a baseline into a bundle",
     )
     apply_baseline.add_argument(
         "--baseline", required=True,

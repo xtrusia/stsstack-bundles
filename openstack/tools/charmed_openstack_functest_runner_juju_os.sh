@@ -376,27 +376,31 @@ run_deploy_from_baseline_flow ()
     local baseline=$DEPLOY_FROM_BASELINE
     local bundle
     local in_bundle
-    local out_bundle
+    local model_name
     local model
     local ret=0
 
     bundle="$(python3 "$TOOLS_PATH/extract_job_target.py" "$target")"
     in_bundle="tests/bundles/$bundle.yaml"
-    out_bundle="tests/bundles/${bundle}-baseline.yaml"
-    model="$(qualify_model "test-$target")"
+    model_name="test-$target"
+    model="$(qualify_model "$model_name")"
 
-    apply_baseline_to_bundle "$baseline" "$in_bundle" "$out_bundle" \
-        || return $?
     ensure_func_noop_env "$recreate_noop" || return $?
-    juju add-model "test-$target" --no-switch || return $?
+    juju add-model "$model_name" --no-switch || return $?
     configure_checkpoint_model "$model" || return $?
 
+    # Pre-create machines pinned to baseline images and deploy with
+    # --map-machines=existing. juju refuses image-id constraints inside
+    # bundle yaml so we run add-machine + juju deploy directly.
+    JUJU_CMD="$CHECKPOINT_JUJU_CMD" \
+        OPENSTACK_CMD="$CHECKPOINT_OPENSTACK_CMD" \
+        "$(checkpoint_tool)" redeploy \
+        --baseline "$baseline" \
+        --model "$model" \
+        --bundle "$in_bundle" || return $?
+
     . .tox/func-noop/bin/activate
-    functest-deploy -b "$out_bundle" -m "$model" || ret=$?
-    if ((! ret)); then
-        juju status -m "$model"
-        functest-configure -m "$model" || ret=$?
-    fi
+    functest-configure -m "$model" || ret=$?
     if ((! ret)) && $DEPLOY_FROM_BASELINE_RUN_TEST; then
         functest-test -m "$model" || ret=$?
     fi
