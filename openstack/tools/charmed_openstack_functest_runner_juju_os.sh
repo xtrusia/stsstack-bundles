@@ -9,6 +9,8 @@
 #
 FUNC_TEST_PR=
 FUNC_TEST_TARGET=()
+BAKE_BASELINE=
+BAKE_SKIP_CLEANUP=false
 CHECKPOINT_ALLOW_VOLUME_BACKED=false
 CHECKPOINT_CREATE=
 CHECKPOINT_DIR=${JUJU_MODEL_CHECKPOINT_DIR:-$HOME/juju-model-checkpoints}
@@ -102,6 +104,14 @@ OPTIONS:
     --checkpoint-verify-images
         Download each snapshot image during checkpoint creation and verify
         Glance hash metadata before accepting the checkpoint.
+    --bake-baseline NAME
+        Run zaza deploy and configure phases for one target, then bake
+        baseline Glance images for fast redeploy. The source model becomes
+        unusable after baking (juju agent is wiped, cloud-init is reset)
+        and should be destroyed before deploying from the baseline.
+    --bake-skip-cleanup
+        Skip in-VM cleanup (cloud-init clean, juju agent removal) before
+        snapshotting. Debugging only — new deploys will likely fail.
     --help
         This help message.
 
@@ -282,6 +292,59 @@ run_checkpoint_create_flow ()
     return $ret
 }
 
+bake_baseline ()
+{
+    local model=$1
+    local target=$2
+    local name=$BAKE_BASELINE
+    local args=( --allow-volume-backed )
+
+    if [[ -z $name ]]; then
+        name="${CHARM_NAME}-${target}-${COMMIT_ID}"
+    fi
+    if $BAKE_SKIP_CLEANUP; then
+        args+=( --skip-cleanup )
+    fi
+    JUJU_CMD="$CHECKPOINT_JUJU_CMD" \
+        OPENSTACK_CMD="$CHECKPOINT_OPENSTACK_CMD" \
+        "$(checkpoint_tool)" bake \
+        -m "$model" \
+        --name "$name" \
+        --output-dir "$CHECKPOINT_DIR" \
+        "${args[@]}"
+}
+
+
+run_bake_baseline_flow ()
+{
+    local target=$1
+    local recreate_noop=$2
+    local bundle
+    local model
+    local ret=0
+
+    bundle="$(python3 "$TOOLS_PATH/extract_job_target.py" "$target")"
+    model="$(qualify_model "test-$target")"
+
+    ensure_func_noop_env "$recreate_noop" || return $?
+    juju add-model "test-$target" --no-switch || return $?
+    configure_checkpoint_model "$model" || return $?
+
+    . .tox/func-noop/bin/activate
+    functest-deploy -b "tests/bundles/$bundle.yaml" -m "$model" || ret=$?
+    if ((! ret)); then
+        juju status -m "$model"
+        functest-configure -m "$model" || ret=$?
+    fi
+    if ((! ret)); then
+        juju status -m "$model"
+        bake_baseline "$model" "$target" || ret=$?
+    fi
+    deactivate
+    return $ret
+}
+
+
 run_test_phase ()
 {
     local phase=$1
@@ -422,6 +485,13 @@ while (($# > 0)); do
         --checkpoint-verify-images)
             CHECKPOINT_VERIFY_IMAGES=true
             ;;
+        --bake-baseline)
+            BAKE_BASELINE=$2
+            shift
+            ;;
+        --bake-skip-cleanup)
+            BAKE_SKIP_CLEANUP=true
+            ;;
         --help|-h)
             usage
             exit 0
@@ -437,6 +507,12 @@ done
 
 if [[ -n $CHECKPOINT_CREATE && -n $CHECKPOINT_RESTORE ]]; then
     echo "ERROR: --checkpoint-create and --checkpoint-restore are mutually exclusive" >&2
+    exit 1
+fi
+
+if [[ -n $BAKE_BASELINE ]] && \
+   [[ -n $CHECKPOINT_CREATE || -n $CHECKPOINT_RESTORE ]]; then
+    echo "ERROR: --bake-baseline is mutually exclusive with --checkpoint-create/--checkpoint-restore" >&2
     exit 1
 fi
 
@@ -676,6 +752,20 @@ for target in ${func_target_order[@]}; do
         [[ -d src ]] && pushd src &>/dev/null || true
         fail=false
         run_checkpoint_create_flow "$target" "$init_noop_target" || fail=true
+        popd &>/dev/null || true
+        init_noop_target=false
+        if $fail; then
+            func_target_state[$target]='fail'
+        else
+            func_target_state[$target]='success'
+        fi
+        continue
+    fi
+
+    if [[ -n $BAKE_BASELINE ]]; then
+        [[ -d src ]] && pushd src &>/dev/null || true
+        fail=false
+        run_bake_baseline_flow "$target" "$init_noop_target" || fail=true
         popd &>/dev/null || true
         init_noop_target=false
         if $fail; then

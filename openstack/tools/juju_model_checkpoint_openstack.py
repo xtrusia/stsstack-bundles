@@ -38,6 +38,20 @@ DEFAULT_CHECKPOINT_DIR = "~/.local/share/juju-model-checkpoints"
 JUJU_CMD = os.environ.get("JUJU_CMD", "juju")
 OPENSTACK_CMD = os.environ.get("OPENSTACK_CMD", "openstack")
 
+# Cleanup commands run via ssh inside each machine before baking a baseline
+# image. The goal is to remove the prior juju agent and reset cloud-init so
+# the snapshot can be reused as a fresh boot image by a new juju model.
+SSH_CLEANUP_SCRIPT = """\
+set -u
+sudo pkill -9 -f jujud 2>/dev/null || true
+sudo rm -rf /var/lib/juju /var/log/juju
+sudo rm -f /etc/systemd/system/jujud-machine-*.service
+sudo rm -f /etc/systemd/system/multi-user.target.wants/jujud-machine-*.service
+sudo systemctl daemon-reload || true
+sudo cloud-init clean --logs --seed
+sudo sync
+"""
+
 
 class CheckpointError(RuntimeError):
     """Raised when a checkpoint operation cannot continue."""
@@ -185,6 +199,74 @@ def machine_instance_map(status: dict[str, Any]) -> dict[str, str]:
     if not machines:
         raise CheckpointError("model has no machines to checkpoint")
     return machines
+
+
+def _base_from_status(machine: dict[str, Any]) -> str:
+    """Return a `name@channel` base string for a juju status machine entry."""
+    base = machine.get("base") or {}
+    name = base.get("name")
+    channel = base.get("channel", "")
+    if name and channel:
+        return f"{name}@{channel.split('/')[0]}"
+    series = machine.get("series")
+    if series:
+        return f"ubuntu@{series}"
+    raise CheckpointError(
+        "machine entry has neither base nor series; cannot derive base"
+    )
+
+
+def collect_machine_metadata(
+    status: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Return machine_id -> {base, series, address} for baseline baking."""
+    meta: dict[str, dict[str, Any]] = {}
+    for machine_id, machine in sorted(status.get("machines", {}).items()):
+        address = machine.get("dns-name") or next(
+            iter(machine.get("ip-addresses") or []), None
+        )
+        if not address:
+            raise CheckpointError(
+                f"machine {machine_id} has no usable address for ssh"
+            )
+        meta[machine_id] = {
+            "base": _base_from_status(machine),
+            "series": machine.get("series"),
+            "address": address,
+        }
+    return meta
+
+
+def ssh_cleanup_machine(
+    address: str,
+    machine_id: str,
+    ssh_user: str,
+) -> None:
+    """Run cleanup commands inside a juju machine over ssh."""
+    target = f"{ssh_user}@{address}"
+    cmd = [
+        "ssh",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR",
+        "-o", "ConnectTimeout=15",
+        target,
+        "bash -s",
+    ]
+    proc = subprocess.run(
+        cmd,
+        input=SSH_CLEANUP_SCRIPT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode:
+        raise CheckpointError(
+            f"ssh cleanup of machine {machine_id} ({target}) failed "
+            f"({proc.returncode}):\nstdout:\n{proc.stdout}\n"
+            f"stderr:\n{proc.stderr}"
+        )
 
 
 def openstack_server_show(server_id: str) -> dict[str, Any]:
@@ -447,6 +529,90 @@ def command_create(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_bake(args: argparse.Namespace) -> int:
+    """Bake baseline images for a juju model so it can be redeployed fast.
+
+    Unlike ``create`` this is destructive to the source model: the in-VM
+    cleanup wipes the juju agent and resets cloud-init, so the source model
+    is expected to be destroyed afterwards. The resulting Glance images are
+    meant to be referenced by ``image-id`` constraints when redeploying the
+    same bundle into a fresh model.
+    """
+    info, status, machines = validate_model(args.model, allow_busy=args.force)
+    timestamp = utc_timestamp()
+    name = args.name or model_short_name(info, args.model)
+    root = checkpoint_root(args.output_dir)
+    baseline_dir = root / f"baseline-{slug(name)}-{timestamp}"
+    baseline_dir.mkdir(parents=True, exist_ok=False)
+
+    machine_meta = collect_machine_metadata(status)
+    manifest: dict[str, Any] = {
+        "schema": 1,
+        "type": "baseline",
+        "backend": "openstack",
+        "created_at": timestamp,
+        "name": name,
+        "source_model": args.model,
+        "source_model_uuid": model_uuid(info),
+        "source_model_short_name": model_short_name(info, args.model),
+        "controller": info.get("controller-name"),
+        "cloud": info.get("cloud"),
+        "region": info.get("region"),
+        "juju_agent_version": info.get("agent-version"),
+        "machines": {},
+    }
+    write_json(baseline_dir / MANIFEST, manifest)
+    save_supporting_state(baseline_dir, args.model)
+
+    for machine_id, instance_id in machines.items():
+        meta = machine_meta[machine_id]
+        server = openstack_server_show(instance_id)
+        if has_attached_volumes(server) and not args.allow_volume_backed:
+            raise CheckpointError(
+                f"server for machine {machine_id} has attached volumes; "
+                "this PoC only allows that with --allow-volume-backed"
+            )
+
+        if not args.skip_cleanup:
+            print(
+                f"cleanup machine {machine_id} via ssh {meta['address']}"
+            )
+            ssh_cleanup_machine(meta["address"], machine_id, args.ssh_user)
+
+        image_name = (
+            f"baseline-{slug(name)}-m{slug(machine_id)}-{timestamp}"
+        )
+        properties = {
+            "juju_baseline": slug(name),
+            "juju_source_model_uuid": model_uuid(info),
+            "juju_machine_id": machine_id,
+            "juju_source_instance_id": instance_id,
+            "juju_base": meta["base"],
+        }
+        print(f"snapshot machine {machine_id}: {instance_id} -> {image_name}")
+        image_id = openstack_server_snapshot(
+            instance_id,
+            image_name,
+            properties,
+        )
+
+        manifest["machines"][machine_id] = {
+            "source_instance_id": instance_id,
+            "base": meta["base"],
+            "series": meta.get("series"),
+            "snapshot_image_id": image_id,
+            "snapshot_image_name": image_name,
+        }
+        write_json(baseline_dir / MANIFEST, manifest)
+
+    print(f"baseline written to {baseline_dir}")
+    print(
+        "note: source model machines have been cleaned in place; "
+        "destroy the source model before deploying from this baseline."
+    )
+    return 0
+
+
 def verify_restore_target(
     manifest: dict[str, Any],
     model: str,
@@ -584,6 +750,29 @@ def build_parser() -> argparse.ArgumentParser:
         help="download each snapshot image and verify Glance hash metadata",
     )
     create.set_defaults(func=command_create)
+
+    bake = subparsers.add_parser(
+        "bake",
+        help="bake baseline images for fast redeploy",
+    )
+    bake.add_argument("-m", "--model", required=True)
+    bake.add_argument("--name", help="baseline name")
+    bake.add_argument("--output-dir", help="metadata directory")
+    bake.add_argument("--force", action="store_true",
+                      help="allow a non-idle model")
+    bake.add_argument(
+        "--allow-volume-backed",
+        action="store_true",
+        help="allow servers with attached volumes",
+    )
+    bake.add_argument("--ssh-user", default="ubuntu",
+                      help="ssh user for in-VM cleanup")
+    bake.add_argument(
+        "--skip-cleanup",
+        action="store_true",
+        help="skip ssh-based in-VM cleanup (debugging only)",
+    )
+    bake.set_defaults(func=command_bake)
 
     restore = subparsers.add_parser("restore", help="restore in place")
     restore.add_argument("-m", "--model", required=True)
