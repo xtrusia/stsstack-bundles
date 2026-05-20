@@ -239,6 +239,62 @@ def collect_machine_metadata(
     return meta
 
 
+def openstack_server_nova_attrs(server_id: str) -> dict[str, Any]:
+    """Extract Nova attributes needed to re-create a sibling VM.
+
+    Returns flavor_id, networks (name->[ips]), security_groups, key_name,
+    availability_zone. These are needed by restore-v2 to boot a new VM
+    that mirrors the original machine's placement.
+    """
+    raw = run([
+        OPENSTACK_CMD, "server", "show", server_id,
+        "-f", "yaml",
+        "-c", "flavor",
+        "-c", "addresses",
+        "-c", "security_groups",
+        "-c", "key_name",
+        "-c", "OS-EXT-AZ:availability_zone",
+    ])
+    info = yaml.safe_load(raw) or {}
+    flavor_field = info.get("flavor")
+    flavor_id: str | None = None
+    if isinstance(flavor_field, dict):
+        flavor_id = flavor_field.get("id")
+    elif isinstance(flavor_field, str):
+        match = re.search(r"\(([0-9a-fA-F-]{36})\)", flavor_field)
+        flavor_id = match.group(1) if match else flavor_field
+    sg_field = info.get("security_groups") or []
+    sg_names = [
+        sg.get("name") if isinstance(sg, dict) else sg
+        for sg in sg_field
+    ]
+    return {
+        "flavor_id": flavor_id,
+        "networks": info.get("addresses") or {},
+        "security_groups": [s for s in sg_names if s],
+        "key_name": info.get("key_name"),
+        "availability_zone": info.get("OS-EXT-AZ:availability_zone"),
+    }
+
+
+def juju_create_backup(
+    controller: str,
+    output_path: pathlib.Path,
+) -> None:
+    """Run `juju create-backup` against the controller model.
+
+    Captures controller MongoDB state (model UUIDs, machines, units,
+    relations, secrets) into a tar.gz. Pair with VM snapshots for a
+    controller-aware restore.
+    """
+    run([
+        JUJU_CMD, "create-backup",
+        "-B",
+        "-m", f"{controller}:admin/controller",
+        "--filename", str(output_path),
+    ])
+
+
 def ssh_cleanup_machine(
     model: str,
     machine_id: str,
@@ -312,6 +368,55 @@ def openstack_server_snapshot(
     return image_id
 
 
+def wait_for_server_status(
+    server_id: str,
+    target: str,
+    *,
+    timeout: int = 180,
+    interval: float = 2.0,
+) -> None:
+    """Block until an OpenStack server reaches the target status."""
+    deadline = time.monotonic() + timeout
+    last_status = "(unknown)"
+    while time.monotonic() < deadline:
+        server = openstack_server_show(server_id)
+        last_status = server.get("status") or server.get("Status") or "(unset)"
+        if last_status == target:
+            return
+        if last_status == "ERROR":
+            raise CheckpointError(
+                f"server {server_id} entered ERROR state while waiting "
+                f"for {target}"
+            )
+        time.sleep(interval)
+    raise CheckpointError(
+        f"timed out waiting for server {server_id} to reach {target} "
+        f"(last status: {last_status})"
+    )
+
+
+def openstack_server_stop(server_id: str) -> None:
+    """Stop a Nova server gracefully and wait until it is SHUTOFF.
+
+    A graceful shutdown lets the guest OS unmount its filesystems and
+    flush ext4 journal + page cache to disk. Snapshotting an offline VM
+    produces a clean image, where live snapshots (and nova `suspend`,
+    which is implemented as a libvirt pause on stsstack and does NOT
+    flush the guest's in-memory state) leave the resulting image with
+    corrupted inodes for any file modified close to snapshot time:
+    truncated mmap'd binaries, 0-byte unit files, "Structure needs
+    cleaning" on the ext4 metadata.
+    """
+    run([OPENSTACK_CMD, "server", "stop", server_id])
+    wait_for_server_status(server_id, "SHUTOFF", timeout=300)
+
+
+def openstack_server_start(server_id: str) -> None:
+    """Start a previously stopped Nova server and wait until ACTIVE."""
+    run([OPENSTACK_CMD, "server", "start", server_id])
+    wait_for_server_status(server_id, "ACTIVE", timeout=300)
+
+
 def openstack_rebuild_server(
     server_id: str,
     image_id: str,
@@ -342,6 +447,87 @@ def openstack_image_show(image_id: str) -> dict[str, Any]:
     """Return OpenStack image metadata."""
     return run([OPENSTACK_CMD, "image", "show", image_id, "-f", "json"],
                json_output=True)
+
+
+def snapshot_with_verify_retry(
+    *,
+    instance_id: str,
+    base_image_name: str,
+    properties: dict[str, str],
+    verify: bool,
+    max_attempts: int,
+    stop_source: bool = True,
+) -> tuple[str, str]:
+    """Snapshot a server, optionally verify the image download, retry on fail.
+
+    When ``stop_source`` is true (the default) the source server is
+    stopped (graceful shutdown) for the entire snapshot+verify window so
+    the resulting image is fully consistent. Without that, nova's live
+    snapshot leaves ext4 in a state where mmap'd binaries and files
+    modified near snapshot time end up truncated or unreadable on the
+    new instance — the root cause of the M5 "agent lost" / SIGSEGV jujud
+    behaviour. ``nova suspend`` was tried first but on stsstack it
+    resolves to a libvirt pause that does not flush guest memory, so it
+    is insufficient.
+
+    Glance/Nova snapshots in this lab also occasionally land in an
+    unbootable state at the image level (download returns InvalidResponse,
+    `nova boot` reports Corrupt image download). The retry loop covers
+    both classes of failure. Returns (image_id, image_name) on success.
+    """
+    last_error: Exception | None = None
+    stopped = False
+    try:
+        if stop_source:
+            print(f"  stop source {instance_id} for clean snapshot")
+            openstack_server_stop(instance_id)
+            stopped = True
+        for attempt in range(1, max_attempts + 1):
+            attempt_name = (
+                base_image_name if attempt == 1
+                else f"{base_image_name}-retry{attempt}"
+            )
+            try:
+                image_id = openstack_server_snapshot(
+                    instance_id, attempt_name, properties
+                )
+            except CheckpointError as exc:
+                last_error = exc
+                print(
+                    f"snapshot attempt {attempt}/{max_attempts} failed: {exc}"
+                )
+                continue
+
+            if not verify:
+                return image_id, attempt_name
+
+            try:
+                openstack_verify_image_download(image_id)
+                return image_id, attempt_name
+            except CheckpointError as exc:
+                last_error = exc
+                print(
+                    f"verify attempt {attempt}/{max_attempts} failed for "
+                    f"{image_id}: {exc}"
+                )
+                try:
+                    openstack_delete_image(image_id)
+                except CheckpointError as cleanup_exc:
+                    print(f"  failed to delete corrupt image: {cleanup_exc}")
+
+        raise CheckpointError(
+            f"snapshot+verify failed after {max_attempts} attempts for "
+            f"server {instance_id}: {last_error}"
+        )
+    finally:
+        if stopped:
+            print(f"  start source {instance_id}")
+            try:
+                openstack_server_start(instance_id)
+            except CheckpointError as exc:
+                print(
+                    f"  WARNING: start failed for {instance_id}: {exc}"
+                )
 
 
 def openstack_verify_image_download(image_id: str) -> None:
@@ -629,7 +815,7 @@ def command_bake(args: argparse.Namespace) -> int:
             )
             ssh_cleanup_machine(args.model, machine_id, args.ssh_user)
 
-        image_name = (
+        image_name_base = (
             f"baseline-{slug(name)}-m{slug(machine_id)}-{timestamp}"
         )
         properties = {
@@ -639,11 +825,18 @@ def command_bake(args: argparse.Namespace) -> int:
             "juju_source_instance_id": instance_id,
             "juju_base": meta["base"],
         }
-        print(f"snapshot machine {machine_id}: {instance_id} -> {image_name}")
-        image_id = openstack_server_snapshot(
-            instance_id,
-            image_name,
-            properties,
+        print(
+            f"snapshot machine {machine_id}: {instance_id} -> "
+            f"{image_name_base} (verify={args.verify_images}, "
+            f"retries={args.snapshot_retries})"
+        )
+        image_id, image_name = snapshot_with_verify_retry(
+            instance_id=instance_id,
+            base_image_name=image_name_base,
+            properties=properties,
+            verify=args.verify_images,
+            max_attempts=args.snapshot_retries,
+            stop_source=not args.no_stop_source,
         )
 
         manifest["machines"][machine_id] = {
@@ -652,7 +845,21 @@ def command_bake(args: argparse.Namespace) -> int:
             "series": meta.get("series"),
             "snapshot_image_id": image_id,
             "snapshot_image_name": image_name,
+            "nova_attrs": openstack_server_nova_attrs(instance_id),
         }
+        write_json(baseline_dir / MANIFEST, manifest)
+
+    if args.with_controller_backup:
+        controller = info.get("controller-name") or ""
+        if not controller:
+            raise CheckpointError(
+                "cannot find controller name in juju show-model output"
+            )
+        backup_path = baseline_dir / "controller-backup.tar.gz"
+        print(f"create controller backup -> {backup_path}")
+        juju_create_backup(controller, backup_path)
+        manifest["controller_backup"] = backup_path.name
+        manifest["controller_name"] = controller
         write_json(baseline_dir / MANIFEST, manifest)
 
     print(f"baseline written to {baseline_dir}")
@@ -814,6 +1021,268 @@ def command_redeploy(args: argparse.Namespace) -> int:
             timeout=args.idle_timeout,
             interval=args.wait_interval,
         )
+    return 0
+
+
+def nova_boot_from_image(
+    *,
+    image_id: str,
+    name: str,
+    flavor_id: str,
+    networks: list[str],
+    security_groups: list[str],
+    key_name: str | None,
+    availability_zone: str | None,
+) -> str:
+    """Boot a Nova server from a baseline image and return its new UUID."""
+    cmd = [
+        OPENSTACK_CMD, "server", "create",
+        "--image", image_id,
+        "--flavor", flavor_id,
+        "--wait",
+        "-f", "json",
+    ]
+    for net in networks:
+        cmd.extend(["--network", net])
+    for sg in security_groups:
+        cmd.extend(["--security-group", sg])
+    if key_name:
+        cmd.extend(["--key-name", key_name])
+    if availability_zone:
+        cmd.extend(["--availability-zone", availability_zone])
+    cmd.append(name)
+    result = run(cmd, json_output=True)
+    new_id = result.get("id") or result.get("ID")
+    if not new_id:
+        raise CheckpointError(
+            f"could not determine new server id from create: {result}"
+        )
+    return new_id
+
+
+def juju_restore_on_controller(
+    controller: str,
+    backup_local_path: pathlib.Path,
+    juju_restore_local_path: pathlib.Path,
+    *,
+    dry_run: bool = False,
+) -> None:
+    """Copy the backup tarball + juju-restore tool to controller machine 0
+    and run `juju-restore`. Same-controller restore (no --copy-controller)."""
+    ctrl_model = f"{controller}:admin/controller"
+    remote_backup = "/home/ubuntu/controller-backup.tar.gz"
+    remote_tool = "/home/ubuntu/juju-restore"
+    print(f"scp backup -> {ctrl_model} machine 0")
+    run([JUJU_CMD, "scp", "-m", ctrl_model,
+         str(backup_local_path), f"0:{remote_backup}"])
+    print(f"scp juju-restore tool")
+    run([JUJU_CMD, "scp", "-m", ctrl_model,
+         str(juju_restore_local_path), f"0:{remote_tool}"])
+    flags = "--yes" if not dry_run else "--dry-run"
+    print(f"running juju-restore on controller {flags}")
+    run([
+        JUJU_CMD, "ssh", "-m", ctrl_model, "0",
+        f"chmod +x {remote_tool} && "
+        f"sudo {remote_tool} {flags} {remote_backup}",
+    ])
+
+
+MONGO_UPDATE_SCRIPT_TEMPLATE = """\
+set -u
+PASS=$(grep '^statepassword' /var/lib/juju/agents/machine-0/agent.conf | awk '{print $2}')
+# Mongo's TLS config requires the snap-visible CA copy. Idempotent.
+if [ ! -f /var/snap/juju-db/common/ca.crt ]; then
+    cp /var/lib/juju/ca.crt /var/snap/juju-db/common/ca.crt
+    chmod 644 /var/snap/juju-db/common/ca.crt
+fi
+/snap/bin/juju-db.mongo --quiet \\
+    --port 37017 \\
+    --tls --tlsAllowInvalidCertificates \\
+    --tlsCAFile /var/snap/juju-db/common/ca.crt \\
+    --tlsCertificateKeyFile /var/snap/juju-db/common/server.pem \\
+    --authenticationDatabase admin \\
+    -u machine-0 -p "$PASS" \\
+    juju --eval '
+__JS__
+'
+"""
+
+MONGO_UPDATE_JS_TEMPLATE = """\
+var modelUuid = "__MODEL_UUID__";
+var updates = __UPDATES_JSON__;
+updates.forEach(function(u) {
+    var id = modelUuid + ":" + u.machine_id;
+    var res = db.instanceData.updateOne(
+        { _id: id, "model-uuid": modelUuid, machineid: u.machine_id },
+        { $set: { instanceid: u.new_instance_id } }
+    );
+    print(JSON.stringify({
+        machine_id: u.machine_id,
+        new_instance_id: u.new_instance_id,
+        matched: res.matchedCount,
+        modified: res.modifiedCount
+    }));
+});
+"""
+
+
+def mongo_update_instance_ids(
+    controller: str,
+    model_uuid: str,
+    updates: list[dict[str, str]],
+) -> None:
+    """Update each machine.instance-id in the controller MongoDB.
+
+    `updates` is a list of {machine_id, new_instance_id}. Runs the mongo
+    shell inside controller machine 0 via `juju ssh ... -- sudo bash -s`.
+    """
+    if not updates:
+        return
+    js = (
+        MONGO_UPDATE_JS_TEMPLATE
+        .replace("__MODEL_UUID__", model_uuid)
+        .replace("__UPDATES_JSON__", json.dumps(updates))
+    )
+    script = MONGO_UPDATE_SCRIPT_TEMPLATE.replace("__JS__", js)
+    ctrl_model = f"{controller}:admin/controller"
+    cmd = [JUJU_CMD, "ssh", "-m", ctrl_model, "0", "sudo bash -s"]
+    proc = subprocess.run(
+        cmd,
+        input=script,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if proc.returncode:
+        raise CheckpointError(
+            f"mongo update failed ({proc.returncode}):\n"
+            f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        )
+    print(proc.stdout.rstrip())
+
+
+def command_mongo_update_machines(args: argparse.Namespace) -> int:
+    """Apply instance-id updates from a new-instance map file."""
+    map_path = pathlib.Path(args.map_file).expanduser()
+    if not map_path.exists():
+        raise CheckpointError(f"map file not found: {map_path}")
+    data = json.loads(map_path.read_text(encoding="utf-8"))
+    controller = args.controller or data.get("controller_name")
+    model_uuid = args.model_uuid or data.get("source_model_uuid")
+    new_instances = data.get("new_instances") or {}
+    if not controller or not model_uuid or not new_instances:
+        raise CheckpointError(
+            "map file missing controller_name / source_model_uuid / "
+            "new_instances"
+        )
+    updates = [
+        {"machine_id": mid, "new_instance_id": uid}
+        for mid, uid in sorted(new_instances.items())
+    ]
+    print(
+        f"updating instanceData on {controller} for model {model_uuid}: "
+        f"{len(updates)} machine(s)"
+    )
+    mongo_update_instance_ids(controller, model_uuid, updates)
+    return 0
+
+
+def command_restore_v2(args: argparse.Namespace) -> int:
+    """Restore a baseline + controller backup into the same controller.
+
+    Steps:
+      1. boot a new Nova VM from each baseline image
+      2. transfer controller backup + juju-restore tool to controller machine 0
+      3. run juju-restore (MongoDB state reverts to bake time)
+      4. update each machine.instance-id in mongo to the new VM UUID
+      5. wait until the restored model returns to idle
+
+    Step 4 is implemented in a separate command (`mongo-update-machines`)
+    because the exact mongo collection layout is verified live.
+    """
+    baseline_path = pathlib.Path(args.baseline).expanduser()
+    baseline = read_manifest(baseline_path)
+    if baseline.get("type") != "baseline":
+        raise CheckpointError(
+            f"manifest is not a baseline: type={baseline.get('type')!r}"
+        )
+    if not baseline.get("controller_backup"):
+        raise CheckpointError(
+            "baseline manifest has no controller_backup; bake with "
+            "--with-controller-backup"
+        )
+
+    controller = args.controller or baseline.get("controller_name")
+    if not controller:
+        raise CheckpointError(
+            "controller name not in manifest; pass --controller"
+        )
+
+    backup_dir = (
+        baseline_path if baseline_path.is_dir() else baseline_path.parent
+    )
+    backup_file = backup_dir / baseline["controller_backup"]
+    juju_restore_tool = pathlib.Path(args.juju_restore_path).expanduser()
+    if not juju_restore_tool.exists():
+        raise CheckpointError(
+            f"juju-restore tool not found at {juju_restore_tool}"
+        )
+
+    # 1. boot new VMs from baseline images
+    new_instances: dict[str, str] = {}
+    timestamp = utc_timestamp()
+    machines = baseline.get("machines") or {}
+    for machine_id, mv in sorted(machines.items()):
+        attrs = mv.get("nova_attrs") or {}
+        if not attrs.get("flavor_id"):
+            raise CheckpointError(
+                f"machine {machine_id} has no flavor_id in baseline; "
+                "re-bake to capture nova_attrs"
+            )
+        networks = list((attrs.get("networks") or {}).keys())
+        if args.skip_security_groups:
+            sgs: list[str] = []
+        else:
+            sgs = attrs.get("security_groups") or []
+        name = (
+            f"restore-{slug(baseline.get('name', 'baseline'))}-"
+            f"m{slug(machine_id)}-{timestamp}"
+        )
+        print(f"boot {name} from {mv['snapshot_image_id']} (sgs={sgs or 'default'})")
+        new_uuid = nova_boot_from_image(
+            image_id=mv["snapshot_image_id"],
+            name=name,
+            flavor_id=attrs["flavor_id"],
+            networks=networks,
+            security_groups=sgs,
+            key_name=attrs.get("key_name"),
+            availability_zone=attrs.get("availability_zone"),
+        )
+        new_instances[machine_id] = new_uuid
+        print(f"  machine {machine_id} -> new instance {new_uuid}")
+
+    # write a sidecar mapping for later mongo-update-machines step
+    map_file = backup_dir / f"new-instances-{timestamp}.json"
+    write_json(map_file, {
+        "source_model_uuid": baseline.get("source_model_uuid"),
+        "controller_name": controller,
+        "new_instances": new_instances,
+    })
+    print(f"new-instance map written to {map_file}")
+
+    # 2-3. juju-restore (or dry-run)
+    juju_restore_on_controller(
+        controller,
+        backup_file,
+        juju_restore_tool,
+        dry_run=args.restore_dry_run,
+    )
+
+    print(
+        "next step: run `mongo-update-machines` with the new-instance map "
+        f"({map_file}) to retarget juju machines to the new Nova instances."
+    )
     return 0
 
 
@@ -994,7 +1463,67 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip ssh-based in-VM cleanup (debugging only)",
     )
+    bake.add_argument(
+        "--with-controller-backup",
+        action="store_true",
+        help="also run `juju create-backup` and store the archive next to "
+             "the baseline manifest (required for restore-v2)",
+    )
+    bake.add_argument(
+        "--verify-images",
+        action="store_true",
+        help="download each snapshot image and verify Glance hash to catch "
+             "corruption at bake time",
+    )
+    bake.add_argument(
+        "--snapshot-retries", type=int, default=3,
+        help="how many times to retry snapshot+verify on a single machine "
+             "before giving up (default: 3)",
+    )
+    bake.add_argument(
+        "--no-stop-source",
+        action="store_true",
+        help="do NOT stop the source server while snapshotting "
+             "(debugging only; live snapshots corrupt ext4 inodes on "
+             "stsstack — see snapshot_with_verify_retry docstring)",
+    )
     bake.set_defaults(func=command_bake)
+
+    mongo_update = subparsers.add_parser(
+        "mongo-update-machines",
+        help="update machine.instance-id in controller mongo from a map file",
+    )
+    mongo_update.add_argument("--map-file", required=True,
+                              help="new-instances JSON written by restore-v2")
+    mongo_update.add_argument("--controller",
+                              help="override controller name from map file")
+    mongo_update.add_argument("--model-uuid",
+                              help="override model UUID from map file")
+    mongo_update.set_defaults(func=command_mongo_update_machines)
+
+    restore_v2 = subparsers.add_parser(
+        "restore-v2",
+        help="boot new VMs from baseline + run juju-restore (same controller)",
+    )
+    restore_v2.add_argument("--baseline", required=True,
+                            help="baseline manifest directory or file")
+    restore_v2.add_argument("--controller",
+                            help="target juju controller (default: from "
+                                 "manifest)")
+    restore_v2.add_argument(
+        "--juju-restore-path", default="/home/ubuntu/juju-restore",
+        help="path to juju-restore binary on the local box",
+    )
+    restore_v2.add_argument(
+        "--restore-dry-run", action="store_true",
+        help="pass --dry-run to juju-restore (no actual mongo restore)",
+    )
+    restore_v2.add_argument(
+        "--skip-security-groups", action="store_true",
+        help="don't pass --security-group to nova; useful when the "
+             "baseline's juju-created SGs were deleted with the model",
+    )
+    restore_v2.set_defaults(func=command_restore_v2)
 
     redeploy = subparsers.add_parser(
         "redeploy",
