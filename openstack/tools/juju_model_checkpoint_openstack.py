@@ -134,6 +134,80 @@ def juju_model_info(model: str) -> dict[str, Any]:
     return next(iter(raw.values()))
 
 
+# Charms whose state survives a destroy/restore cycle but whose distributed
+# service does NOT auto-recover after every node is power-cycled at the same
+# time. These need an explicit "I am rebooting from a complete outage" admin
+# action before the cluster re-forms.
+#
+# Value is (action_name, target_strategy):
+#   "leader"   — try the leader unit only
+#   "any-unit" — try each deployed unit in turn, stop on the first success.
+#                Needed for mysql-innodb-cluster because the action must be
+#                run on the unit that holds the most up-to-date GTID set,
+#                which is not always the juju leader.
+KNOWN_POST_RESTORE_ACTIONS: dict[str, tuple[str, str]] = {
+    "mysql-innodb-cluster": (
+        "reboot-cluster-from-complete-outage", "any-unit",
+    ),
+}
+
+
+def juju_run_action(
+    model: str,
+    target: str,
+    action_name: str,
+    *,
+    wait: str = "10m",
+) -> dict[str, Any]:
+    """Run a Juju action and return the parsed result map."""
+    return run(
+        [
+            JUJU_CMD, "run", "-m", model,
+            target, action_name,
+            "--wait", wait,
+            "--format", "json",
+        ],
+        json_output=True,
+    )
+
+
+def detect_post_restore_actions(
+    model: str,
+) -> list[tuple[str, list[str], str]]:
+    """Build a plan of post-restore actions by inspecting juju status.
+
+    Returns a list of (app_name, [units to try in order], action_name).
+    For "leader" strategies the unit list contains a single "<app>/leader"
+    pseudo-target; for "any-unit" it contains every concrete unit name,
+    which the caller is expected to try in order until one succeeds.
+    """
+    status = juju_status(model)
+    plans: list[tuple[str, list[str], str]] = []
+    for app, info in (status.get("applications") or {}).items():
+        charm_name = (
+            info.get("charm-name") or info.get("charm") or ""
+        )
+        candidates = {charm_name}
+        if "/" in charm_name:
+            candidates.add(charm_name.rsplit("/", 1)[-1])
+        match = next(
+            (KNOWN_POST_RESTORE_ACTIONS[c] for c in candidates
+             if c in KNOWN_POST_RESTORE_ACTIONS),
+            None,
+        )
+        if not match:
+            continue
+        action_name, strategy = match
+        if strategy == "any-unit":
+            units = sorted((info.get("units") or {}).keys())
+            if not units:
+                continue
+            plans.append((app, units, action_name))
+        else:
+            plans.append((app, [f"{app}/leader"], action_name))
+    return plans
+
+
 def model_uuid(model_info: dict[str, Any]) -> str:
     """Return the Juju model UUID from show-model output."""
     uuid = model_info.get("model-uuid")
@@ -328,6 +402,30 @@ def openstack_server_show(server_id: str) -> dict[str, Any]:
     """Return OpenStack server metadata."""
     return run([OPENSTACK_CMD, "server", "show", server_id, "-f", "json"],
                json_output=True)
+
+
+_NET_ID_CACHE: dict[str, str] = {}
+
+
+def openstack_network_id(name_or_id: str) -> str:
+    """Return a Neutron network UUID given either a name or an existing UUID.
+
+    Cached because openstack server create's --nic option only accepts
+    net-id=<uuid>, never net-name=, so we resolve once and reuse.
+    """
+    if name_or_id in _NET_ID_CACHE:
+        return _NET_ID_CACHE[name_or_id]
+    out = run([
+        OPENSTACK_CMD, "network", "show", name_or_id,
+        "-c", "id", "-f", "value",
+    ])
+    net_id = (out or "").strip()
+    if not net_id:
+        raise CheckpointError(
+            f"could not resolve network id for {name_or_id!r}"
+        )
+    _NET_ID_CACHE[name_or_id] = net_id
+    return net_id
 
 
 def has_attached_volumes(server: dict[str, Any]) -> bool:
@@ -781,12 +879,27 @@ def command_bake(args: argparse.Namespace) -> int:
     baseline_dir.mkdir(parents=True, exist_ok=False)
 
     machine_meta = collect_machine_metadata(status)
+    bundle_sha: str | None = None
+    if args.bundle_path:
+        bundle_path = pathlib.Path(args.bundle_path).expanduser()
+        if bundle_path.is_file():
+            bundle_sha = hashlib.sha256(
+                bundle_path.read_bytes()
+            ).hexdigest()
     manifest: dict[str, Any] = {
-        "schema": 1,
+        "schema": 2,
         "type": "baseline",
         "backend": "openstack",
         "created_at": timestamp,
         "name": name,
+        "workload": args.workload,
+        "openstack_release": args.release,
+        "ubuntu_series": args.ubuntu_series,
+        "bundle_path": (
+            str(pathlib.Path(args.bundle_path).expanduser())
+            if args.bundle_path else None
+        ),
+        "bundle_sha256": bundle_sha,
         "source_model": args.model,
         "source_model_uuid": model_uuid(info),
         "source_model_short_name": model_short_name(info, args.model),
@@ -1030,34 +1143,102 @@ def nova_boot_from_image(
     name: str,
     flavor_id: str,
     networks: list[str],
+    fixed_ips: dict[str, list[str]] | None = None,
     security_groups: list[str],
     key_name: str | None,
     availability_zone: str | None,
+    max_attempts: int = 3,
+    retry_delay: int = 30,
+    build_timeout: int = 300,
 ) -> str:
-    """Boot a Nova server from a baseline image and return its new UUID."""
-    cmd = [
-        OPENSTACK_CMD, "server", "create",
-        "--image", image_id,
-        "--flavor", flavor_id,
-        "--wait",
-        "-f", "json",
-    ]
-    for net in networks:
-        cmd.extend(["--network", net])
-    for sg in security_groups:
-        cmd.extend(["--security-group", sg])
-    if key_name:
-        cmd.extend(["--key-name", key_name])
-    if availability_zone:
-        cmd.extend(["--availability-zone", availability_zone])
-    cmd.append(name)
-    result = run(cmd, json_output=True)
-    new_id = result.get("id") or result.get("ID")
-    if not new_id:
-        raise CheckpointError(
-            f"could not determine new server id from create: {result}"
+    """Boot a Nova server from a baseline image and return its new UUID.
+
+    Retries on transient "Corrupt image download" / scheduling failures
+    we observe when nova-compute fetches a freshly created snapshot
+    image from glance/ceph. Status is polled here rather than via
+    ``--wait`` so we can inspect the ERROR fault detail and clean up
+    before the next attempt.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        attempt_name = name if attempt == 1 else f"{name}-retry{attempt}"
+        cmd = [
+            OPENSTACK_CMD, "server", "create",
+            "--image", image_id,
+            "--flavor", flavor_id,
+            "-f", "json",
+        ]
+        for net in networks:
+            v4 = None
+            if fixed_ips:
+                for ip in fixed_ips.get(net, []):
+                    if ip and ":" not in ip:
+                        v4 = ip
+                        break
+            if v4:
+                cmd.extend([
+                    "--nic",
+                    f"net-id={openstack_network_id(net)},v4-fixed-ip={v4}",
+                ])
+            else:
+                cmd.extend(["--network", net])
+        for sg in security_groups:
+            cmd.extend(["--security-group", sg])
+        if key_name:
+            cmd.extend(["--key-name", key_name])
+        if availability_zone:
+            cmd.extend(["--availability-zone", availability_zone])
+        cmd.append(attempt_name)
+        try:
+            result = run(cmd, json_output=True)
+        except CheckpointError as exc:
+            last_error = exc
+            print(
+                f"  boot attempt {attempt}/{max_attempts} (create) "
+                f"failed: {exc}"
+            )
+            if attempt < max_attempts:
+                time.sleep(retry_delay)
+            continue
+        new_id = result.get("id") or result.get("ID")
+        if not new_id:
+            last_error = CheckpointError(
+                f"no id from server create: {result}"
+            )
+            if attempt < max_attempts:
+                time.sleep(retry_delay)
+            continue
+
+        deadline = time.monotonic() + build_timeout
+        status = "BUILD"
+        fault: Any = None
+        while time.monotonic() < deadline:
+            srv = openstack_server_show(new_id)
+            status = (
+                srv.get("status") or srv.get("Status") or "(unknown)"
+            )
+            if status == "ACTIVE":
+                return new_id
+            if status == "ERROR":
+                fault = srv.get("fault") or srv.get("Fault")
+                break
+            time.sleep(3)
+        last_error = CheckpointError(
+            f"server {new_id} ended with status={status} fault={fault}"
         )
-    return new_id
+        print(
+            f"  boot attempt {attempt}/{max_attempts} ERROR "
+            f"(status={status}); cleaning up {new_id}"
+        )
+        try:
+            run([OPENSTACK_CMD, "server", "delete", "--wait", new_id])
+        except CheckpointError as cleanup_exc:
+            print(f"    cleanup of {new_id} failed: {cleanup_exc}")
+        if attempt < max_attempts:
+            time.sleep(retry_delay)
+    raise CheckpointError(
+        f"nova boot failed after {max_attempts} attempts: {last_error}"
+    )
 
 
 def juju_restore_on_controller(
@@ -1188,6 +1369,85 @@ def command_mongo_update_machines(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_run_post_restore_actions(args: argparse.Namespace) -> int:
+    """Run charm actions needed to bring stateful workloads back online.
+
+    Some charms (mysql-innodb-cluster, etc.) do not auto-recover their
+    distributed service after every member is power-cycled at the same
+    time, which is exactly what a checkpoint restore does. After mongo
+    is updated and jujud has reconnected the new VMs, the leader unit
+    of those charms needs an explicit "rebooting from outage" action.
+    """
+    model = args.model
+    # Explicit --action UNIT=ACTION items each become their own single-target
+    # plan; the app name is derived from the unit prefix.
+    explicit_plans: list[tuple[str, list[str], str]] = []
+    for spec in args.action or []:
+        unit, sep, name = spec.partition("=")
+        if not sep or not unit or not name:
+            raise CheckpointError(
+                f"--action must be UNIT=ACTION (e.g. "
+                f"'mysql-innodb-cluster/leader=reboot-cluster-from-complete-outage'),"
+                f" got {spec!r}"
+            )
+        app = unit.split("/", 1)[0] if "/" in unit else unit
+        explicit_plans.append((app, [unit], name))
+
+    detected_plans: list[tuple[str, list[str], str]] = []
+    if not args.no_auto_detect:
+        detected_plans = detect_post_restore_actions(model)
+
+    seen_keys: set[tuple[str, str]] = set()
+    plans: list[tuple[str, list[str], str]] = []
+    for plan in explicit_plans + detected_plans:
+        key = (plan[0], plan[2])  # (app, action) — dedupe explicit vs detected
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        plans.append(plan)
+
+    if not plans:
+        print("no post-restore actions to run "
+              "(no --action given and no known charms detected)")
+        return 0
+
+    print(f"planned {len(plans)} post-restore action(s):")
+    for app, units, name in plans:
+        print(f"  - {app} via {units} -> {name}")
+
+    failures: list[str] = []
+    for app, units, name in plans:
+        succeeded = False
+        last_error = "(no unit attempted)"
+        for unit in units:
+            print(f"--- run {name} on {unit} ---")
+            try:
+                result = juju_run_action(model, unit, name, wait=args.wait)
+            except CheckpointError as exc:
+                last_error = str(exc)
+                print(f"  call failed: {exc}")
+                continue
+            task = (
+                next(iter(result.values()), {})
+                if isinstance(result, dict) else {}
+            ) or {}
+            status = (task.get("status") or "(unknown)").lower()
+            message = task.get("message") or ""
+            print(f"  outcome: {status} {('('+message+')') if message else ''}")
+            if status in ("completed", "success"):
+                succeeded = True
+                break
+            last_error = f"{status}: {message}"
+        if not succeeded:
+            failures.append(f"{app}/{name}: {last_error}")
+
+    if failures:
+        raise CheckpointError(
+            "post-restore actions failed:\n  " + "\n  ".join(failures)
+        )
+    return 0
+
+
 def command_restore_v2(args: argparse.Namespace) -> int:
     """Restore a baseline + controller backup into the same controller.
 
@@ -1240,7 +1500,14 @@ def command_restore_v2(args: argparse.Namespace) -> int:
                 f"machine {machine_id} has no flavor_id in baseline; "
                 "re-bake to capture nova_attrs"
             )
-        networks = list((attrs.get("networks") or {}).keys())
+        raw_networks = attrs.get("networks") or {}
+        networks = list(raw_networks.keys())
+        fixed_ips: dict[str, list[str]] | None = None
+        if not args.no_keep_ips:
+            fixed_ips = {
+                net: [ip for ip in (raw_networks.get(net) or []) if ip]
+                for net in networks
+            }
         if args.skip_security_groups:
             sgs: list[str] = []
         else:
@@ -1249,12 +1516,23 @@ def command_restore_v2(args: argparse.Namespace) -> int:
             f"restore-{slug(baseline.get('name', 'baseline'))}-"
             f"m{slug(machine_id)}-{timestamp}"
         )
-        print(f"boot {name} from {mv['snapshot_image_id']} (sgs={sgs or 'default'})")
+        ip_info = (
+            ",".join(
+                ip for net in networks
+                for ip in (fixed_ips or {}).get(net, [])
+            )
+            if fixed_ips else "(any)"
+        )
+        print(
+            f"boot {name} from {mv['snapshot_image_id']} "
+            f"(sgs={sgs or 'default'}, ips={ip_info})"
+        )
         new_uuid = nova_boot_from_image(
             image_id=mv["snapshot_image_id"],
             name=name,
             flavor_id=attrs["flavor_id"],
             networks=networks,
+            fixed_ips=fixed_ips,
             security_groups=sgs,
             key_name=attrs.get("key_name"),
             availability_zone=attrs.get("availability_zone"),
@@ -1411,6 +1689,95 @@ def command_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_list_baselines(args: argparse.Namespace) -> int:
+    """Catalogue all bake baselines under output-dir.
+
+    Reads each baseline-*/manifest.json and prints a single-line summary
+    keyed on the schema v2 metadata (workload, release, series, bundle).
+    Supports --release, --workload, --series filters so the catalogue
+    can be narrowed when many bakes accumulate.
+    """
+    root = checkpoint_root(args.output_dir)
+    if not root.exists():
+        print(f"no checkpoint directory: {root}")
+        return 0
+
+    def short(value: Any, width: int) -> str:
+        if value is None:
+            return "-".ljust(width)
+        text = str(value)
+        if len(text) > width:
+            text = text[: width - 1] + "…"
+        return text.ljust(width)
+
+    rows: list[dict[str, Any]] = []
+    for manifest_path in sorted(root.glob("baseline-*/manifest.json")):
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        baseline_dir = manifest_path.parent
+        backup_file = baseline_dir / "controller-backup.tar.gz"
+        rows.append({
+            "dir": baseline_dir.name,
+            "name": manifest.get("name"),
+            "workload": manifest.get("workload"),
+            "release": manifest.get("openstack_release"),
+            "series": manifest.get("ubuntu_series"),
+            "machines": len(manifest.get("machines", {}) or {}),
+            "created_at": manifest.get("created_at"),
+            "has_backup": backup_file.is_file(),
+            "bundle_path": manifest.get("bundle_path"),
+            "bundle_sha256": manifest.get("bundle_sha256"),
+        })
+
+    def passes(row: dict[str, Any]) -> bool:
+        if args.workload and (row["workload"] or "") != args.workload:
+            return False
+        if args.release and (row["release"] or "") != args.release:
+            return False
+        if args.series and (row["series"] or "") != args.series:
+            return False
+        return True
+
+    rows = [r for r in rows if passes(r)]
+
+    if not rows:
+        print("no baselines matched the filter")
+        return 0
+
+    header = (
+        f"{short('NAME', 28)} "
+        f"{short('WORKLOAD', 12)} "
+        f"{short('SERIES', 8)} "
+        f"{short('RELEASE', 10)} "
+        f"{short('MACHINES', 9)} "
+        f"{short('BACKUP', 7)} "
+        f"{short('CREATED', 19)} "
+        f"DIR"
+    )
+    print(header)
+    print("-" * len(header))
+    for row in rows:
+        print(
+            f"{short(row['name'], 28)} "
+            f"{short(row['workload'], 12)} "
+            f"{short(row['series'], 8)} "
+            f"{short(row['release'], 10)} "
+            f"{short(row['machines'], 9)} "
+            f"{short('yes' if row['has_backup'] else 'no', 7)} "
+            f"{short(row['created_at'], 19)} "
+            f"{row['dir']}"
+        )
+    if args.verbose:
+        print()
+        for row in rows:
+            print(f"--- {row['dir']} ---")
+            print(f"  bundle: {row['bundle_path']}")
+            print(f"  bundle_sha256: {row['bundle_sha256']}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI parser."""
     parser = argparse.ArgumentParser(
@@ -1487,6 +1854,27 @@ def build_parser() -> argparse.ArgumentParser:
              "(debugging only; live snapshots corrupt ext4 inodes on "
              "stsstack — see snapshot_with_verify_retry docstring)",
     )
+    bake.add_argument(
+        "--workload",
+        help="logical name of the deployed stack (e.g. designate, cinder). "
+             "Stored in manifest so list-baselines can group by workload.",
+    )
+    bake.add_argument(
+        "--release",
+        help="OpenStack release the source model targets (e.g. yoga, zed, "
+             "2023.1). Stored in manifest for catalog/filter use.",
+    )
+    bake.add_argument(
+        "--ubuntu-series",
+        help="ubuntu series of the source model machines (e.g. jammy, focal). "
+             "Stored in manifest.",
+    )
+    bake.add_argument(
+        "--bundle-path",
+        help="path to the zaza/juju bundle yaml used to deploy this model. "
+             "Stored in manifest along with its sha256 so re-bakes can be "
+             "tied back to a specific bundle version.",
+    )
     bake.set_defaults(func=command_bake)
 
     mongo_update = subparsers.add_parser(
@@ -1500,6 +1888,33 @@ def build_parser() -> argparse.ArgumentParser:
     mongo_update.add_argument("--model-uuid",
                               help="override model UUID from map file")
     mongo_update.set_defaults(func=command_mongo_update_machines)
+
+    post_actions = subparsers.add_parser(
+        "run-post-restore-actions",
+        help="run charm actions needed after a checkpoint restore "
+             "(mysql-innodb-cluster reboot-cluster-from-complete-outage, etc.)",
+    )
+    post_actions.add_argument(
+        "-m", "--model", required=True,
+        help="target juju model in <controller>:<user>/<model> form",
+    )
+    post_actions.add_argument(
+        "--action", action="append", default=[],
+        metavar="UNIT=ACTION",
+        help="add a charm action to run (e.g. "
+             "mysql-innodb-cluster/leader=reboot-cluster-from-complete-outage). "
+             "May be passed multiple times.",
+    )
+    post_actions.add_argument(
+        "--no-auto-detect", action="store_true",
+        help="skip the built-in KNOWN_POST_RESTORE_ACTIONS sweep over "
+             "the model; only run explicit --action entries",
+    )
+    post_actions.add_argument(
+        "--wait", default="10m",
+        help="--wait value passed to juju run (default: 10m)",
+    )
+    post_actions.set_defaults(func=command_run_post_restore_actions)
 
     restore_v2 = subparsers.add_parser(
         "restore-v2",
@@ -1522,6 +1937,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-security-groups", action="store_true",
         help="don't pass --security-group to nova; useful when the "
              "baseline's juju-created SGs were deleted with the model",
+    )
+    restore_v2.add_argument(
+        "--no-keep-ips", action="store_true",
+        help="do NOT request the original v4 fixed IPs for new VMs. "
+             "Default behaviour is to keep IPs so stateful charms "
+             "(group replication, etc.) see the same cluster members.",
     )
     restore_v2.set_defaults(func=command_restore_v2)
 
@@ -1590,6 +2011,21 @@ def build_parser() -> argparse.ArgumentParser:
     list_cmd = subparsers.add_parser("list", help="list local checkpoints")
     list_cmd.add_argument("--output-dir", help="metadata directory")
     list_cmd.set_defaults(func=command_list)
+
+    list_b = subparsers.add_parser(
+        "list-baselines",
+        help="catalogue baked baselines with workload/release/series filter",
+    )
+    list_b.add_argument("--output-dir", help="metadata directory")
+    list_b.add_argument("--workload",
+                        help="filter rows by workload value in manifest")
+    list_b.add_argument("--release",
+                        help="filter rows by openstack_release value in manifest")
+    list_b.add_argument("--series",
+                        help="filter rows by ubuntu_series value in manifest")
+    list_b.add_argument("--verbose", action="store_true",
+                        help="also dump bundle_path and bundle_sha256")
+    list_b.set_defaults(func=command_list_baselines)
 
     return parser
 
