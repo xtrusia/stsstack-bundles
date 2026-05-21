@@ -54,6 +54,42 @@ sudo cloud-init clean --logs --seed
 sudo sync
 """
 
+# Private key juju installs on every machine. Reused for direct ssh to
+# restored VMs during restore-v2, before the controller mongo is updated
+# and `juju ssh` can resolve them. juju 3.x writes this path on the client.
+JUJU_SSH_KEY = os.path.expanduser("~/.local/share/juju/ssh/juju_id_rsa")
+
+# Run on each restored VM to revert the hostname cloud-init assigned from
+# the new Nova instance name back to the bake-time hostname. rabbitmq's
+# Mnesia store is keyed on rabbit@<hostname>: a changed hostname makes
+# rabbitmq start an empty database, dropping every user and vhost. The
+# original Mnesia directory survives inside the snapshot, so reverting the
+# hostname and restarting rabbitmq recovers it.
+HOSTNAME_RESTORE_SCRIPT = """\
+set -u
+NEW="__HOSTNAME__"
+cloud-init status --wait >/dev/null 2>&1 || true
+OLD="$(hostname)"
+if [ -z "$NEW" ]; then
+    echo "no target hostname; skip"
+    exit 0
+fi
+if [ "$OLD" != "$NEW" ]; then
+    hostnamectl set-hostname "$NEW"
+    if grep -qw "$OLD" /etc/hosts; then
+        sed -i "s/\\b$OLD\\b/$NEW/g" /etc/hosts
+    else
+        echo "127.0.1.1 $NEW" >> /etc/hosts
+    fi
+    if systemctl list-unit-files rabbitmq-server.service 2>/dev/null \\
+       | grep -q '^rabbitmq-server'; then
+        systemctl restart rabbitmq-server || true
+        echo "rabbitmq-server restarted"
+    fi
+fi
+echo "hostname: $OLD -> $(hostname)"
+"""
+
 
 class CheckpointError(RuntimeError):
     """Raised when a checkpoint operation cannot continue."""
@@ -309,6 +345,7 @@ def collect_machine_metadata(
             "base": _base_from_status(machine),
             "series": machine.get("series"),
             "address": address,
+            "hostname": machine.get("hostname"),
         }
     return meta
 
@@ -396,6 +433,98 @@ def ssh_cleanup_machine(
             f"({proc.returncode}):\nstdout:\n{proc.stdout}\n"
             f"stderr:\n{proc.stderr}"
         )
+
+
+def ssh_direct_root(
+    ip: str,
+    script: str,
+    *,
+    ssh_user: str = "ubuntu",
+    connect_timeout: int = 10,
+) -> subprocess.CompletedProcess:
+    """Run a script as root on a VM addressed directly by IP.
+
+    Used during restore-v2 before the controller mongo is updated, when
+    `juju ssh` cannot resolve the freshly booted instances yet. Host key
+    checking is disabled because snapshot-restored VMs reuse the source
+    VM's host keys.
+    """
+    cmd = [
+        "ssh",
+        "-i", JUJU_SSH_KEY,
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "LogLevel=ERROR",
+        "-o", f"ConnectTimeout={connect_timeout}",
+        f"{ssh_user}@{ip}",
+        "sudo bash -s",
+    ]
+    return subprocess.run(
+        cmd,
+        input=script,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def wait_for_ssh(ip: str, *, timeout: int = 300) -> None:
+    """Block until a VM accepts ssh, or raise after timeout."""
+    deadline = time.monotonic() + timeout
+    last = ""
+    while time.monotonic() < deadline:
+        proc = ssh_direct_root(ip, "true\n")
+        if proc.returncode == 0:
+            return
+        last = proc.stderr.strip()
+        time.sleep(10)
+    raise CheckpointError(
+        f"ssh to {ip} not reachable within {timeout}s: {last}"
+    )
+
+
+def _first_ipv4(networks: dict[str, Any]) -> str | None:
+    """Return the first IPv4 address across all networks, if any."""
+    for ips in (networks or {}).values():
+        for ip in ips or []:
+            if ip and ":" not in ip:
+                return ip
+    return None
+
+
+def restore_hostnames(machines: dict[str, Any]) -> None:
+    """Revert each restored VM to the hostname captured at bake time.
+
+    cloud-init re-runs in a snapshot-restored VM and sets the hostname
+    from the new Nova instance name. Hostname-bound services (notably
+    rabbitmq) stay broken until the original hostname is back.
+    """
+    for machine_id, mv in sorted(machines.items()):
+        target = mv.get("hostname")
+        if not target:
+            print(
+                f"  machine {machine_id}: no hostname in baseline "
+                "(re-bake to capture); skip"
+            )
+            continue
+        ip = _first_ipv4((mv.get("nova_attrs") or {}).get("networks") or {})
+        if not ip:
+            print(f"  machine {machine_id}: no ipv4 in baseline; skip")
+            continue
+        print(f"  machine {machine_id} ({ip}) -> {target}")
+        wait_for_ssh(ip)
+        proc = ssh_direct_root(
+            ip, HOSTNAME_RESTORE_SCRIPT.replace("__HOSTNAME__", target)
+        )
+        if proc.returncode:
+            raise CheckpointError(
+                f"hostname restore on machine {machine_id} ({ip}) "
+                f"failed ({proc.returncode}):\n"
+                f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+            )
+        for line in proc.stdout.strip().splitlines():
+            print(f"    {line}")
 
 
 def openstack_server_show(server_id: str) -> dict[str, Any]:
@@ -956,6 +1085,7 @@ def command_bake(args: argparse.Namespace) -> int:
             "source_instance_id": instance_id,
             "base": meta["base"],
             "series": meta.get("series"),
+            "hostname": meta.get("hostname"),
             "snapshot_image_id": image_id,
             "snapshot_image_name": image_name,
             "nova_attrs": openstack_server_nova_attrs(instance_id),
@@ -1549,6 +1679,13 @@ def command_restore_v2(args: argparse.Namespace) -> int:
     })
     print(f"new-instance map written to {map_file}")
 
+    # 1b. revert restored VMs to their bake-time hostnames. Snapshot VMs
+    # come up with a cloud-init hostname derived from the new instance
+    # name, which breaks hostname-bound services such as rabbitmq.
+    if not args.skip_hostname_restore:
+        print("restoring bake-time hostnames on new VMs")
+        restore_hostnames(machines)
+
     # 2-3. juju-restore (or dry-run)
     juju_restore_on_controller(
         controller,
@@ -1943,6 +2080,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="do NOT request the original v4 fixed IPs for new VMs. "
              "Default behaviour is to keep IPs so stateful charms "
              "(group replication, etc.) see the same cluster members.",
+    )
+    restore_v2.add_argument(
+        "--skip-hostname-restore", action="store_true",
+        help="do NOT revert restored VMs to their bake-time hostnames. "
+             "Default behaviour reverts them so hostname-bound services "
+             "(rabbitmq Mnesia) keep their data.",
     )
     restore_v2.set_defaults(func=command_restore_v2)
 
