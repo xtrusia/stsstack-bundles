@@ -322,6 +322,12 @@ if [[ -n $FUNC_TEST_PR ]]; then
     apply_func_test_pr $FUNC_TEST_PR
 fi
 
+# Pre-flight: drop orphaned undercloud data-ports so a recycled floating IP is
+# not pinned to a dead gateway port (otherwise guest connectivity hangs).
+if [[ ${CLEAN_ORPHAN_DATAPORTS:-true} == true ]]; then
+    "$(dirname "$0")/clean_orphan_dataports.sh" || true
+fi
+
 declare -A func_target_state=()
 declare -a func_target_order
 if ((${#FUNC_TEST_TARGET[@]})); then
