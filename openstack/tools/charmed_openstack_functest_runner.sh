@@ -212,6 +212,7 @@ done
 
 # Install dependencies
 which yq &>/dev/null || sudo snap install yq
+which uv &>/dev/null || sudo snap install astral-uv --classic
 
 # Ensure zosci-config checked out and up-to-date
 get_and_update_repo https://github.com/openstack-charmers/zosci-config
@@ -410,7 +411,11 @@ for target in ${func_target_order[@]}; do
     _tmpdir_save=${TMPDIR:-}
     export TMPDIR=$TESTS_TMPDIR
     if ! $MANUAL_FUNCTESTS; then
-        tox ${tox_args} -- $_target || fail=true
+        # Run the func-target env via tox-uv so dependencies are installed with
+        # uv instead of the host pip. Building zaza/netifaces/charm-tools wheels
+        # under the Debian-patched setuptools otherwise fails with
+        # "AttributeError: install_layout". --with tox-uv pulls in tox too.
+        uv run --with tox-uv tox ${tox_args} -- $_target || fail=true
         model=$(juju list-models| egrep -o "^zaza-\S+"|tr -d '*')
     else
         $TOOLS_PATH/manual_functests_runner.sh "$_target" $SLEEP $init_noop_target || fail=true
