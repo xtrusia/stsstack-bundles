@@ -417,7 +417,9 @@ elif [[ -n $REMOTE_BUILD ]]; then
     IFS=',' read -ra remote_build_params <<< "$REMOTE_BUILD"
     REMOTE_BUILD_DESTINATION=${remote_build_params[0]}
     REMOTE_BUILD_PATH=${remote_build_params[1]}
-    ssh $REMOTE_BUILD_DESTINATION "cd $REMOTE_BUILD_PATH;git log -1;rm -rf *.charm;tox -re build"
+    # Build on the remote host with uv (matches the local build), so modern
+    # charmcraft-3 reactive charms build the same way; deploy still runs here.
+    ssh $REMOTE_BUILD_DESTINATION "cd $REMOTE_BUILD_PATH; git log -1 2>/dev/null; rm -f *.charm; which uv >/dev/null || sudo snap install astral-uv --classic; sudo lxd init --auto >/dev/null 2>&1 || true; bp=\$(tox --showconfig -e build 2>/dev/null | grep -Po '(?<=python)[0-9.]+' | head -1); echo remote-build-py\${bp:-3.10}; uv run --python \${bp:-3.10} tox -re build"
     rm -rf *.charm
     rsync -vza $REMOTE_BUILD_DESTINATION:$REMOTE_BUILD_PATH/*.charm .
 fi

@@ -37,6 +37,18 @@ run_lane() {
     local args=(--parallel --no-wait)
     [ "$pr" != "-" ] && args+=(--func-test-pr "$pr")
     [ -n "$target" ] && [ "$target" != "-" ] && args+=(--func-test-target "$target")
+    if [ -n "${REMOTE_BUILD_HOST:-}" ]; then
+        # Offload the CPU-heavy build to a remote host (e.g. 0.8, 16-core): give it
+        # a real git checkout at this lane's commit (charmtools needs git for the
+        # charm version); the runner ssh-builds there and rsyncs the .charm back.
+        local rpath="rb-$name"
+        local url=$(git -C "$charmdir" remote get-url origin 2>/dev/null)
+        local commit=$(git -C "$charmdir" rev-parse HEAD 2>/dev/null)
+        ssh "$REMOTE_BUILD_HOST" "mkdir -p $rpath && cd $rpath && { [ -d .git ] || git clone -q $url .; } && git fetch -q origin && git checkout -qf $commit" </dev/null >/dev/null 2>&1
+        args+=(--remote-build "$REMOTE_BUILD_HOST,$rpath")
+    elif ${SKIP_BUILD:-false}; then
+        args+=(--skip-build)
+    fi
     JUJU_DATA="$jd" juju switch "$controller" >/dev/null 2>&1
     { echo "### LANE $name START $(date '+%F %T') controller=$controller pr=$pr target=${target:-<all>}"
       echo "### HEAD: $(git -C "$charmdir" log --oneline -1 2>/dev/null)"; } >> "$log"
