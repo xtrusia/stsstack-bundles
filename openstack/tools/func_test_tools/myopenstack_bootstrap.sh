@@ -15,6 +15,11 @@ METADATA_SOURCE=${METADATA_SOURCE:-$HOME/simplestreams/images}
 BOOTSTRAP_BASE=${BOOTSTRAP_BASE:-ubuntu@22.04}
 BOOTSTRAP_CONSTRAINTS=${BOOTSTRAP_CONSTRAINTS:-mem=4G cores=2}
 CLOUD=${CLOUD:-myopenstack}
+# juju 3.6.25 has a "cannot apply changes: permission denied" regression on
+# relation hooks (breaks reactive charms' ha-relation-joined etc.). Bootstrap
+# lane controllers at the version the known-good os-ctl controller runs.
+# Override with AGENT_VERSION=x.y.z.
+AGENT_VERSION=${AGENT_VERSION:-$(JUJU_DATA="$HOME/.local/share/juju" juju show-controller os-ctl --format json 2>/dev/null | python3 -c 'import sys,json;print(list(json.load(sys.stdin).values())[0]["details"]["agent-version"])' 2>/dev/null)}
 
 # Seed the isolated JUJU_DATA with the cloud + credential definitions so the
 # bootstrap does not touch the shared default juju client state.
@@ -34,7 +39,7 @@ JUJU_DATA="$JD" juju bootstrap "$CLOUD" "$CONTROLLER" \
     --bootstrap-base "$BOOTSTRAP_BASE" \
     --config network="$NET" \
     --config use-default-secgroup=false \
-    --bootstrap-constraints "$BOOTSTRAP_CONSTRAINTS"
+    --bootstrap-constraints "$BOOTSTRAP_CONSTRAINTS" ${AGENT_VERSION:+--agent-version "$AGENT_VERSION"}
 
 # destroy_zaza_models force-deletes stuck models via juju-db mongo, which needs
 # pymongo on the controller machine.
