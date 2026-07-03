@@ -16,13 +16,15 @@ SKIP_BUILD=false
 SLEEP=
 WAIT_ON_DESTROY=true
 RERUN_PHASE=
+PARALLEL_SAFE=false
 
 . $(dirname $0)/func_test_tools/common.sh
 
 # Override destroy_zaza_models: force delete via MongoDB to avoid stuck models.
 destroy_zaza_models ()
 {
-    for model in $(juju list-models 2>/dev/null | grep -oE "^zaza-\S+" | tr -d '*'); do
+    local _zaza_models=$(juju list-models 2>/dev/null | grep -oE "^zaza-\S+" | tr -d '*')
+    for model in $_zaza_models; do
         UUID=$(juju show-model "$model" --format json 2>/dev/null | \
             python3 -c 'import sys,json;print(list(json.load(sys.stdin).values())[0]["model-uuid"])' 2>/dev/null || true)
         [ -z "$UUID" ] && continue
@@ -43,10 +45,21 @@ print('Done')
     juju switch default 2>/dev/null || true
     # Clean up OpenStack resources
     source $OPENRC
-    for id in $(openstack server list -f value -c ID -c Name 2>/dev/null | grep zaza | awk '{print $1}'); do
-        openstack server delete "$id" 2>/dev/null
-    done
-    cleanup_stale_ext_ports
+    if ${PARALLEL_SAFE:-false}; then
+        # Parallel-safe: remove only instances of THIS controller's models
+        # (sibling lanes use different zaza-<id> names). Skip the cloud-wide
+        # sweep and ext-port cleanup which would delete other lanes' resources.
+        for model in $_zaza_models; do
+            for id in $(openstack server list -f value -c ID -c Name 2>/dev/null | grep "$model" | awk '{print $1}'); do
+                openstack server delete "$id" 2>/dev/null
+            done
+        done
+    else
+        for id in $(openstack server list -f value -c ID -c Name 2>/dev/null | grep zaza | awk '{print $1}'); do
+            openstack server delete "$id" 2>/dev/null
+        done
+        cleanup_stale_ext_ports
+    fi
 }
 
 # -------------------------------------------------------------------
@@ -69,6 +82,8 @@ self-hosted Gazpacho OpenStack environment.
 Run from within a charm root directory.
 
 OPTIONS:
+    --parallel
+        Parallel-safe cleanup + build lock (one controller per run).
     --func-test-target TARGET_NAME
         Provide the name of a specific test target to run. If none provided
         all tests are run based on what is defined in osci.yaml. This option
@@ -249,6 +264,9 @@ while (($# > 0)); do
         --debug)
             set -x
             ;;
+        --parallel)
+            PARALLEL_SAFE=true
+            ;;
         --func-test-target)
             FUNC_TEST_TARGET+=( $2 )
             shift
@@ -381,7 +399,14 @@ if ! $SKIP_BUILD; then
     build_python_version=$(tox --showconfig -e build 2>/dev/null | grep -P '^base_?python' | grep -Po '(?<=python)[0-9.]+' | head -1)
     build_python_version=${build_python_version:-3.10}
     echo "Using Python$build_python_version for the charm build"
-    uv run --python "$build_python_version" tox -re build
+    if ${PARALLEL_SAFE:-false}; then
+        # Serialize charmcraft builds across parallel lanes: a CPU-saturated
+        # build starves sibling lanes' libjuju event loops and drops their
+        # controller websockets. flock keeps one build running at a time.
+        flock /tmp/functest-charmbuild.lock uv run --python "$build_python_version" tox -re build
+    else
+        uv run --python "$build_python_version" tox -re build
+    fi
 elif [[ -n $REMOTE_BUILD ]]; then
     IFS=',' read -ra remote_build_params <<< "$REMOTE_BUILD"
     REMOTE_BUILD_DESTINATION=${remote_build_params[0]}
