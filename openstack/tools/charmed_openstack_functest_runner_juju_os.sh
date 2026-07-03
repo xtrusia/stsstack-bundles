@@ -518,7 +518,7 @@ for target in ${func_target_order[@]}; do
         if [ -f "$_vault_setup" ] && grep -q "intermediate_csr = action.data\['results'\]\['output'\]" "$_vault_setup"; then
             sed -i "s/    intermediate_csr = action.data\['results'\]\['output'\]/    if action.status == \"failed\" or \"output\" not in action.data.get(\"results\", {}):\\n        logging.info(\"Vault CA already configured, skipping CSR setup\")\\n        return\\n    intermediate_csr = action.data[\"results\"][\"output\"]/" "$_vault_setup"
         fi
-        uv run --with tox-uv tox -e func-target -- $_target || fail=true
+        uv run --with tox-uv tox -e func-target -x testenv:func-target.passenv+=JUJU_DATA -- $_target || fail=true
         model=$(juju list-models| egrep -o "^zaza-\S+"|tr -d '*')
 
         # Stop DNS patch watcher
