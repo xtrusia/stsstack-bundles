@@ -20,7 +20,6 @@ RERUN_PHASE=
 . $(dirname $0)/func_test_tools/common.sh
 
 # Override destroy_zaza_models: force delete via MongoDB to avoid stuck models.
-PASSWORD="d6E6xi6LDXpecYOVTSGF5I3h"
 destroy_zaza_models ()
 {
     for model in $(juju list-models 2>/dev/null | grep -oE "^zaza-\S+" | tr -d '*'); do
@@ -29,8 +28,9 @@ destroy_zaza_models ()
         [ -z "$UUID" ] && continue
         echo "Force destroying model $model ($UUID)"
         juju ssh -m controller 0 "sudo python3 -c \"
-import pymongo
-client=pymongo.MongoClient('mongodb://machine-0:${PASSWORD}@127.0.0.1:37017/admin',tls=True,tlsCAFile='/var/snap/juju-db/common/ca.crt',tlsCertificateKeyFile='/var/snap/juju-db/common/server.pem',tlsAllowInvalidHostnames=True,directConnection=True,serverSelectionTimeoutMS=5000)
+import re,glob,pymongo
+pw=re.search(r'statepassword:\s*(\S+)',open(glob.glob('/var/lib/juju/agents/machine-*/agent.conf')[0]).read()).group(1)
+client=pymongo.MongoClient('127.0.0.1',37017,username='machine-0',password=pw,authSource='admin',tls=True,tlsCAFile='/var/snap/juju-db/common/ca.crt',tlsCertificateKeyFile='/var/snap/juju-db/common/server.pem',tlsAllowInvalidHostnames=True,directConnection=True,serverSelectionTimeoutMS=8000)
 juju_db=client['juju']
 juju_db.models.delete_one({'_id':'${UUID}'})
 client.drop_database('${UUID}'.replace('-',''))
@@ -298,6 +298,7 @@ done
 
 # Install dependencies
 which yq &>/dev/null || sudo snap install yq
+which uv &>/dev/null || sudo snap install astral-uv --classic
 
 # Ensure zosci-config checked out and up-to-date
 get_and_update_repo https://github.com/openstack-charmers/zosci-config
@@ -367,10 +368,20 @@ LOGFILE=$(mktemp --suffix=-charm-func-test-results)
 (
 # 2. Build
 if ! $SKIP_BUILD; then
+    # Only refresh charmcraft when osci.yaml pins a channel; otherwise keep the
+    # installed charmcraft (modern charms build with charmcraft 3.x).
     CHARMCRAFT_CHANNEL=$(grep charmcraft_channel osci.yaml | sed -r 's/.+:\s+(\S+)/\1/')
-    sudo snap refresh charmcraft --channel ${CHARMCRAFT_CHANNEL:-"1.5/stable"}
+    if [[ -n $CHARMCRAFT_CHANNEL ]]; then
+        sudo snap refresh charmcraft --channel $CHARMCRAFT_CHANNEL
+    else
+        echo "No charmcraft_channel in osci.yaml - keeping installed charmcraft ($(snap list charmcraft | awk 'NR==2{print $4}'))"
+    fi
     lxd init --auto || true
-    tox -re build
+    # Detect the build interpreter from tox and provide it via uv.
+    build_python_version=$(tox --showconfig -e build 2>/dev/null | grep -P '^base_?python' | grep -Po '(?<=python)[0-9.]+' | head -1)
+    build_python_version=${build_python_version:-3.10}
+    echo "Using Python$build_python_version for the charm build"
+    uv run --python "$build_python_version" tox -re build
 elif [[ -n $REMOTE_BUILD ]]; then
     IFS=',' read -ra remote_build_params <<< "$REMOTE_BUILD"
     REMOTE_BUILD_DESTINATION=${remote_build_params[0]}
@@ -460,17 +471,17 @@ for target in ${func_target_order[@]}; do
 
         # Install tox env first, then patch zaza, then run tests
         if [[ $tox_args == *"-re"* ]]; then
-            tox -re func-target --notest || true
+            uv run --with tox-uv tox -re func-target --notest || true
         fi
         # Patch zaza subnetpool_prefix to avoid overlap with provider-net (192.168.0.0/16)
-        _neutron_setup=".tox/func-target/lib/python3.8/site-packages/zaza/openstack/charm_tests/neutron/setup.py"
+        _neutron_setup="$(ls .tox/func-target/lib/python3.*/site-packages/zaza/openstack/charm_tests/neutron/setup.py 2>/dev/null | head -1)"
         [ -f "$_neutron_setup" ] && sed -i 's|"subnetpool_prefix": "192.168.0.0/16"|"subnetpool_prefix": "10.0.0.0/16"|' "$_neutron_setup"
         # Patch vault setup.py for retry safety
-        _vault_setup=".tox/func-target/lib/python3.8/site-packages/zaza/openstack/charm_tests/vault/setup.py"
+        _vault_setup="$(ls .tox/func-target/lib/python3.*/site-packages/zaza/openstack/charm_tests/vault/setup.py 2>/dev/null | head -1)"
         if [ -f "$_vault_setup" ] && grep -q "intermediate_csr = action.data\['results'\]\['output'\]" "$_vault_setup"; then
             sed -i "s/    intermediate_csr = action.data\['results'\]\['output'\]/    if action.status == \"failed\" or \"output\" not in action.data.get(\"results\", {}):\\n        logging.info(\"Vault CA already configured, skipping CSR setup\")\\n        return\\n    intermediate_csr = action.data[\"results\"][\"output\"]/" "$_vault_setup"
         fi
-        tox -e func-target -- $_target || fail=true
+        uv run --with tox-uv tox -e func-target -- $_target || fail=true
         model=$(juju list-models| egrep -o "^zaza-\S+"|tr -d '*')
 
         # Stop DNS patch watcher
@@ -482,7 +493,7 @@ for target in ${func_target_order[@]}; do
             fix_brex_on_gateway $model
             echo "Retrying configure and test phases after DNS patch..."
                 # Patch vault setup.py to handle already-initialized vault (KeyError: 'output')
-            _vault_setup=".tox/func-target/lib/python3.8/site-packages/zaza/openstack/charm_tests/vault/setup.py"
+            _vault_setup="$(ls .tox/func-target/lib/python3.*/site-packages/zaza/openstack/charm_tests/vault/setup.py 2>/dev/null | head -1)"
             if [ -f "$_vault_setup" ] && grep -q "intermediate_csr = action.data\['results'\]\['output'\]" "$_vault_setup"; then
                 sed -i 's/    intermediate_csr = action.data\[.results.\]\[.output.\]/    if action.status == "failed" or "output" not in action.data.get("results", {}):\n        logging.info("Vault CA already configured, skipping CSR setup")\n        return\n    intermediate_csr = action.data["results"]["output"]/' "$_vault_setup"
                 echo "Vault setup.py patched for retry"
