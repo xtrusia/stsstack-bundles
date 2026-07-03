@@ -425,7 +425,7 @@ elif [[ -n $REMOTE_BUILD ]]; then
     # charmcraft-3 reactive charms build the same way; deploy still runs here.
     # Cache built charms by commit: same commit is not rebuilt (build is the
     # slow part; deploy/test failures do not invalidate the .charm).
-    ssh $REMOTE_BUILD_DESTINATION "cd $REMOTE_BUILD_PATH; git log -1 2>/dev/null; c=\$(git rev-parse HEAD 2>/dev/null); mkdir -p ~/.charm-cache; rm -f *.charm; if [ -n \"\$c\" ] && [ -f ~/.charm-cache/\$c.charm ]; then echo remote-build-cached-\${c:0:12}; cp ~/.charm-cache/\$c.charm ./built-\$c.charm; else which uv >/dev/null || sudo snap install astral-uv --classic; sudo lxd init --auto >/dev/null 2>&1 || true; bp=\$(tox --showconfig -e build 2>/dev/null | grep -Po '(?<=python)[0-9.]+' | head -1); echo remote-build-py\${bp:-3.10}; uv run --python \${bp:-3.10} tox -re build && cp *.charm ~/.charm-cache/\$c.charm 2>/dev/null; fi"
+    ssh $REMOTE_BUILD_DESTINATION "cd $REMOTE_BUILD_PATH; git log -1 2>/dev/null; c=\$(git rev-parse HEAD 2>/dev/null); mkdir -p ~/.charm-cache/\$c; rm -f *.charm; if [ -n \"\$c\" ] && ls ~/.charm-cache/\$c/*.charm >/dev/null 2>&1; then echo remote-build-cached-\${c:0:12}; cp ~/.charm-cache/\$c/*.charm ./; else which uv >/dev/null || sudo snap install astral-uv --classic; sudo lxd init --auto >/dev/null 2>&1 || true; bp=\$(tox --showconfig -e build 2>/dev/null | grep -Po '(?<=python)[0-9.]+' | head -1); echo remote-build-py\${bp:-3.10}; uv run --python \${bp:-3.10} tox -re build && cp *.charm ~/.charm-cache/\$c/ 2>/dev/null; fi"
     rm -rf *.charm
     rsync -vza $REMOTE_BUILD_DESTINATION:$REMOTE_BUILD_PATH/*.charm .
 fi
