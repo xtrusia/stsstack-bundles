@@ -54,6 +54,10 @@ print('Done')
                 openstack server delete "$id" 2>/dev/null
             done
         done
+        # remove this lane's leaked VIP ports (allocate_zaza_vip leaves them behind)
+        for _vp in $(openstack port list -f value -c ID -c Name 2>/dev/null | grep "$VIP_PORT_PREFIX" | awk '{print $1}'); do
+            openstack port delete "$_vp" 2>/dev/null
+        done
     else
         for id in $(openstack server list -f value -c ID -c Name 2>/dev/null | grep zaza | awk '{print $1}'); do
             openstack server delete "$id" 2>/dev/null
