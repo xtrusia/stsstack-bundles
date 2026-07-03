@@ -20,6 +20,7 @@ CLOUD=${CLOUD:-myopenstack}
 # lane controllers at the version the known-good os-ctl controller runs.
 # Override with AGENT_VERSION=x.y.z.
 AGENT_VERSION=${AGENT_VERSION:-$(JUJU_DATA="$HOME/.local/share/juju" juju show-controller os-ctl --format json 2>/dev/null | python3 -c 'import sys,json;print(list(json.load(sys.stdin).values())[0]["details"]["agent-version"])' 2>/dev/null)}
+AGENT_VERSION=${AGENT_VERSION:-3.6.23}  # fallback when os-ctl is gone; bump when juju past 3.6.25 fixes the regression
 
 # Seed the isolated JUJU_DATA with the cloud + credential definitions so the
 # bootstrap does not touch the shared default juju client state.
