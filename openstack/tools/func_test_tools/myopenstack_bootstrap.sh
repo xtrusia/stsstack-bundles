@@ -46,4 +46,9 @@ JUJU_DATA="$JD" juju bootstrap "$CLOUD" "$CONTROLLER" \
 # pymongo on the controller machine.
 JUJU_DATA="$JD" juju ssh -m controller 0 \
     "sudo apt-get update -qq && sudo apt-get install -y python3-pymongo" || true
+# Serve local image metadata over http and point new models at it so the
+# openstack provisioner resolves cloud images. bootstrap --metadata-source and
+# "juju metadata add-image" do NOT feed the provisioner; image-metadata-url does.
+pgrep -f "http.server 8099" >/dev/null || (cd "$HOME/simplestreams/images" && setsid python3 -m http.server 8099 --bind 0.0.0.0 >/tmp/meta-http.log 2>&1 &)
+JUJU_DATA="$JD" juju model-defaults -c "$CONTROLLER" image-metadata-url="http://192.168.0.9:8099/" 2>/dev/null
 echo "Controller $CONTROLLER ready."
