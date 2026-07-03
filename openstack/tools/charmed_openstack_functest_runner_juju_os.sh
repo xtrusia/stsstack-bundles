@@ -361,6 +361,12 @@ allocate_zaza_vip ()
     echo $vip_addr
 }
 
+if ${PARALLEL_SAFE:-false} && [ "$VIP_PORT_PREFIX" = "zaza-vip" ]; then
+    # Parallel lanes share the cloud project; scope VIP port names by the
+    # lane's controller so concurrent lanes never allocate the same VIP.
+    _ctrl=$(juju whoami 2>/dev/null | awk '/^Controller:/ {print $2}')
+    VIP_PORT_PREFIX="zaza-vip-${_ctrl:-$$}"
+fi
 for ((i=2;i;i-=1)); do
     export {OS,TEST}_VIP0$((i-1))=$(allocate_zaza_vip 0$((i-1)))
 done
