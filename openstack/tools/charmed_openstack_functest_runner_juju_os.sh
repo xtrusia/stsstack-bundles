@@ -520,6 +520,11 @@ for target in ${func_target_order[@]}; do
         if [ -f "$_vault_setup" ] && grep -q "intermediate_csr = action.data\['results'\]\['output'\]" "$_vault_setup"; then
             sed -i "s/    intermediate_csr = action.data\['results'\]\['output'\]/    if action.status == \"failed\" or \"output\" not in action.data.get(\"results\", {}):\\n        logging.info(\"Vault CA already configured, skipping CSR setup\")\\n        return\\n    intermediate_csr = action.data[\"results\"][\"output\"]/" "$_vault_setup"
         fi
+        # Patch zaza keystone session for connect_retries: absorbs the transient
+        # "Connection refused" on keystone :35357 when apache2/haproxy briefly reload
+        # during a config-change hook (AuthenticationAuthorizationTest flake under load).
+        _ks_utils="$(ls .tox/func-target/lib/python3.*/site-packages/zaza/openstack/utilities/openstack.py 2>/dev/null | head -1)"
+        [ -f "$_ks_utils" ] && sed -i 's|return session.Session(auth=auth, verify=verify)|return session.Session(auth=auth, verify=verify, connect_retries=3)|' "$_ks_utils"
         uv run --with tox-uv tox -e func-target -x testenv:func-target.passenv+=JUJU_DATA,TEST_MODEL_SETTINGS,TEST_MODEL_CONSTRAINTS,OS_VIP*,TEST_VIP* -- $_target || fail=true
         model=$(juju list-models| egrep -o "^zaza-\S+"|tr -d '*')
 
