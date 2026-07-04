@@ -51,4 +51,11 @@ JUJU_DATA="$JD" juju ssh -m controller 0 \
 # "juju metadata add-image" do NOT feed the provisioner; image-metadata-url does.
 pgrep -f "http.server 8099" >/dev/null || (cd "$HOME/simplestreams/images" && setsid python3 -m http.server 8099 --bind 0.0.0.0 >/tmp/meta-http.log 2>&1 &)
 JUJU_DATA="$JD" juju model-defaults -c "$CONTROLLER" image-metadata-url="http://192.168.0.9:8099/" 2>/dev/null
+# Set network as a model-default too: bootstrap --config network only sets the
+# CONTROLLER model, but zaza's per-test models must also carry it. juju only
+# auto-skips security groups on a port_security-disabled network when that network
+# is in the model's networks list (openstack provider, BUG 1680787). myopenstack
+# disables port_security for the hacluster VIP, so without this the zaza model has
+# no network -> juju attaches an SG -> nova SecurityGroupCannotBeApplied, nothing boots.
+JUJU_DATA="$JD" juju model-defaults -c "$CONTROLLER" network="$NET" 2>/dev/null
 echo "Controller $CONTROLLER ready."
