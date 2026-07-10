@@ -121,6 +121,11 @@ ENVIRONMENT VARIABLES (override defaults):
     OS_NETWORK          OpenStack network name (default: provider-net)
     OS_SUBNET           OpenStack subnet name (default: provider-subnet)
     VIP_PORT_PREFIX     Port name prefix for VIPs (default: zaza-vip)
+    CRAFT_BUILD_ENVIRONMENT
+                        charmcraft provider, forwarded to --remote-build hosts.
+                        Set to "multipass" when the remote host's kernel is
+                        newer than the charm's base (default: charmcraft's own,
+                        which is lxd on linux)
 EOF
 }
 
@@ -425,7 +430,19 @@ elif [[ -n $REMOTE_BUILD ]]; then
     # charmcraft-3 reactive charms build the same way; deploy still runs here.
     # Cache built charms by commit: same commit is not rebuilt (build is the
     # slow part; deploy/test failures do not invalidate the .charm).
-    ssh $REMOTE_BUILD_DESTINATION "cd $REMOTE_BUILD_PATH; git log -1 2>/dev/null; c=\$(git rev-parse HEAD 2>/dev/null); mkdir -p ~/.charm-cache/\$c; rm -f *.charm; if [ -n \"\$c\" ] && ls ~/.charm-cache/\$c/*.charm >/dev/null 2>&1; then echo remote-build-cached-\${c:0:12}; cp ~/.charm-cache/\$c/*.charm ./; else which uv >/dev/null || sudo snap install astral-uv --classic; sudo lxd init --auto >/dev/null 2>&1 || true; bp=\$(tox --showconfig -e build 2>/dev/null | grep -Po '(?<=python)[0-9.]+' | head -1); echo remote-build-py\${bp:-3.10}; uv run --python \${bp:-3.10} tox -re build && cp *.charm ~/.charm-cache/\$c/ 2>/dev/null; fi"
+    # Bake charm-helpers #925 (catch dns.exception.Timeout in ns_query) into the
+    # build for stable branches that never got the backport (only stable/caracal
+    # did, in charm-helpers#965). ns925-patch.py is a no-op on branches that
+    # already have the fix (master). Separate -ns925 cache namespace.
+    # Forward the charmcraft provider when the caller picked one. A host whose
+    # kernel is newer than the charm's base cannot build it in an LXD container:
+    # the container shares the host kernel, and the base's apparmor_parser fails
+    # to load snap-confine policy into it, so snapd never starts and charmcraft
+    # aborts. CRAFT_BUILD_ENVIRONMENT=multipass boots a VM with its own kernel
+    # instead. tox drops env vars absent from passenv, so add it there too.
+    REMOTE_ENV=""
+    [[ -n ${CRAFT_BUILD_ENVIRONMENT:-} ]] && REMOTE_ENV="CRAFT_BUILD_ENVIRONMENT=$CRAFT_BUILD_ENVIRONMENT"
+    ssh $REMOTE_BUILD_DESTINATION "cd $REMOTE_BUILD_PATH; git log -1 2>/dev/null; c=\$(git rev-parse HEAD 2>/dev/null); python3 ~/ns925-patch.py; mkdir -p ~/.charm-cache/\$c-ns925; rm -f *.charm; if [ -n \"\$c\" ] && ls ~/.charm-cache/\$c-ns925/*.charm >/dev/null 2>&1; then echo remote-build-cached-ns925-\${c:0:12}; cp ~/.charm-cache/\$c-ns925/*.charm ./; else which uv >/dev/null || sudo snap install astral-uv --classic; sudo lxd init --auto >/dev/null 2>&1 || true; bp=\$(tox --showconfig -e build 2>/dev/null | grep -Po '(?<=python)[0-9.]+' | head -1); echo remote-build-py\${bp:-3.10}-ns925; $REMOTE_ENV uv run --python \${bp:-3.10} tox -re build -x testenv:build.passenv+=CRAFT_BUILD_ENVIRONMENT && cp *.charm ~/.charm-cache/\$c-ns925/ 2>/dev/null; fi"
     rm -rf *.charm
     rsync -vza $REMOTE_BUILD_DESTINATION:$REMOTE_BUILD_PATH/*.charm .
 fi
