@@ -4,7 +4,8 @@
 # cleanup only ever touches that lane's own instances. The runner serializes the
 # charmcraft build with a flock (CPU-heavy builds otherwise starve sibling lanes'
 # libjuju event loops and drop their controller websockets); deploy and test
-# phases overlap freely.
+# phases overlap freely. Set REMOTE_BUILD_HOST (e.g. 0.7, 16-core) to offload
+# that build off the client host entirely.
 #
 # Usage: parallel_functest_driver.sh <lanes-file>
 # Each non-empty, non-'#' line of <lanes-file>:
@@ -38,7 +39,7 @@ run_lane() {
     [ "$pr" != "-" ] && args+=(--func-test-pr "$pr")
     [ -n "$target" ] && [ "$target" != "-" ] && args+=(--func-test-target "$target")
     if [ -n "${REMOTE_BUILD_HOST:-}" ]; then
-        # Offload the CPU-heavy build to a remote host (e.g. 0.8, 16-core): give it
+        # Offload the CPU-heavy build to a remote host (e.g. 0.7, 16-core): give it
         # a real git checkout at this lane's commit (charmtools needs git for the
         # charm version); the runner ssh-builds there and rsyncs the .charm back.
         local rpath="rb-$name"
