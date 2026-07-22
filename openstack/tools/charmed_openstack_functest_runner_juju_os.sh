@@ -180,14 +180,15 @@ cleanup_stale_ext_ports ()
 fix_brex_on_gateway ()
 {
     local model=$1
-    echo "Ensuring br-ex is UP on neutron-gateway..."
+    local dp; dp=$(juju config -m $model neutron-gateway data-port 2>/dev/null)
+    echo "Enslaving data-port ($dp) into br-ex on neutron-gateway units..."
     for unit in $(juju status -m $model neutron-gateway --format json 2>/dev/null | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
 for name in d.get('applications', {}).get('neutron-gateway', {}).get('units', {}):
     print(name)
 " 2>/dev/null); do
-        juju exec -m $model --unit $unit -- 'sudo ip link set br-ex up 2>/dev/null && echo "br-ex UP on '$unit'"' 2>/dev/null || true
+        juju exec -m $model --unit $unit -- "sudo bash -c 'for spec in $dp; do br=\${spec%%:*}; mac=\${spec#*:}; iface=\$(ip -o link | grep -i \"\$mac\" | head -1 | cut -d: -f2 | tr -d \" \"); [ -n \"\$iface\" ] || iface=\$mac; ovs-vsctl --may-exist add-port \$br \$iface 2>/dev/null; ip link set \$iface up 2>/dev/null; ip link set \$br up 2>/dev/null; echo \"  enslaved \$iface into \$br\"; done'" 2>/dev/null || true
     done
 }
 
