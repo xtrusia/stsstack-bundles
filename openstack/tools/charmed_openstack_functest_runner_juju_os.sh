@@ -348,6 +348,7 @@ source $OPENRC
 export {,TEST_}CIDR_EXT=$(openstack subnet show $OS_SUBNET -c cidr -f value)
 export {,TEST_}NET_ID=$(openstack network show $OS_NETWORK -f value -c id)
 export {,TEST_}GATEWAY=$(openstack subnet show $OS_SUBNET -c gateway_ip -f value)
+echo "### undercloud net vars: NET_ID=[$NET_ID] CIDR_EXT=[$CIDR_EXT] GATEWAY=[$GATEWAY]"
 
 # FIP range: use the allocation pool range from the subnet
 # Floating IP range for overcloud ext_net — must NOT overlap with undercloud
@@ -542,7 +543,7 @@ for target in ${func_target_order[@]}; do
         # during a config-change hook (AuthenticationAuthorizationTest flake under load).
         _ks_utils="$(ls .tox/func-target/lib/python3.*/site-packages/zaza/openstack/utilities/openstack.py 2>/dev/null | head -1)"
         [ -f "$_ks_utils" ] && sed -i 's|return session.Session(auth=auth, verify=verify)|return session.Session(auth=auth, verify=verify, connect_retries=3)|' "$_ks_utils"
-        uv run --with tox-uv tox -e func-target -x testenv:func-target.passenv+=JUJU_DATA,TEST_MODEL_SETTINGS,TEST_MODEL_CONSTRAINTS,OS_VIP*,TEST_VIP* -- $_target || fail=true
+        uv run --with tox-uv tox -e func-target -x testenv:func-target.passenv+=JUJU_DATA,OS_*,TEST_*,CS_*,NET_ID,GATEWAY,CIDR_EXT,CIDR_PRIV,NAME_SERVER,NAMESERVER,FIP_RANGE -- $_target || fail=true
         model=$(juju list-models| egrep -o "^zaza-\S+"|tr -d '*')
 
         # Stop DNS patch watcher
